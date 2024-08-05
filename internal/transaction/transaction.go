@@ -1,29 +1,21 @@
 package transaction
 
 import (
-	"github.com/sdrshn-nmbr/bulletant/internal/storage"
-)
-
-type OperationType int
-
-const (
-	Get    OperationType = iota // 0
-	Put                         // 1
-	Delete                      // 2
+	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
 type Operation struct {
-	Type  OperationType
-	Key   storage.Key
-	Value storage.Value
+	Type  types.OperationType
+	Key   types.Key
+	Value types.Value
 }
 
 type TransactionStatus int
 
 const (
-	Pending   TransactionStatus = iota // 0
-	Committed                          // 1
-	Aborted                            // 2
+	Pending TransactionStatus = iota
+	Committed
+	Aborted
 )
 
 type Transaction struct {
@@ -38,16 +30,17 @@ func NewTransaction() *Transaction {
 	}
 }
 
-func (t *Transaction) Put(key storage.Key, val storage.Value) {
+func (t *Transaction) Put(key types.Key, val types.Value) {
 	t.Operations = append(t.Operations, Operation{
-		Type:  Put,
+		Type:  types.Put,
 		Key:   key,
 		Value: val,
 	})
 }
-func (t *Transaction) Delete(key storage.Key, val storage.Value) {
+
+func (t *Transaction) Delete(key types.Key) {
 	t.Operations = append(t.Operations, Operation{
-		Type:  Delete,
-		Key:   key,
+		Type: types.Delete,
+		Key:  key,
 	})
 }

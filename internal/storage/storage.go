@@ -1,21 +1,11 @@
 package storage
 
 import (
-	// "sync"
-	"time"
+	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
-type Key []byte
-type Value []byte
-
-type Entry struct {
-	Key Key
-	Value Value
-	Timestamp time.Time
-}
-
 type Storage interface {
-	Get(key Key) (Value, error)
-	Put(key Key, value Value) error
-	Delete (key Key) error
+	Get(key types.Key) (types.Value, error)
+	Put(key types.Key, value types.Value) error
+	Delete (key types.Key) error
 }

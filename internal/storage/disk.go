@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/sdrshn-nmbr/bulletant/internal/types"
 	"golang.org/x/exp/mmap"
 )
 
@@ -43,7 +44,7 @@ func NewDiskStorage(filename string) (*DiskStorage, error) {
 	}, nil
 }
 
-func (d *DiskStorage) Put(key Key, value Value) error {
+func (d *DiskStorage) Put(key types.Key, value types.Value) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -69,7 +70,7 @@ func (d *DiskStorage) Put(key Key, value Value) error {
 	}
 	offset += 4
 
-	_, err = d.file.WriteAt(key, offset)
+	_, err = d.file.WriteAt([]byte(key), offset)
 	if err != nil {
 		return err
 	}
@@ -90,7 +91,7 @@ func (d *DiskStorage) Put(key Key, value Value) error {
 	return d.remapFile()
 }
 
-func (d *DiskStorage) Get(key Key) (Value, error) {
+func (d *DiskStorage) Get(key types.Key) (types.Value, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -127,7 +128,7 @@ func (d *DiskStorage) Get(key Key) (Value, error) {
 			}
 
 			if string(value) == TOMBSTONE {
-				return nil, errors.New("Key does not exist - has been deleted previously")
+				return nil, errors.New("key does not exist - has been deleted previously")
 			}
 
 			return value, nil
@@ -136,10 +137,10 @@ func (d *DiskStorage) Get(key Key) (Value, error) {
 		offset += int64(valLen)
 	}
 
-	return nil, errors.New("Key does not exist")
+	return nil, errors.New("key does not exist")
 }
 
-func (d *DiskStorage) Delete(key Key) error {
+func (d *DiskStorage) Delete(key types.Key) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -188,7 +189,7 @@ func (d *DiskStorage) Delete(key Key) error {
 		offset += int64(valLen)
 	}
 
-	return errors.New("Key does not exist")
+	return errors.New("key does not exist")
 }
 
 func (d *DiskStorage) growFile(additionalSize int64) error {
