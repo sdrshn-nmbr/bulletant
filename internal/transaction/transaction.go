@@ -44,3 +44,5 @@ func (t *Transaction) Delete(key types.Key) {
 		Key:  key,
 	})
 }
+
+// No Get method as when transacting, we only consider methods that change the data itself -> Get does not change the data

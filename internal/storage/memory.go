@@ -50,6 +50,36 @@ func (ps *PartitionedStorage) getPartition(key types.Key) *MemoryStorage {
 	return ps.partitions[partitionIdx]
 }
 
+func (ps *PartitionedStorage) ExecuteTransaction(t *transaction.Transaction) error {
+	// Group ops by partition
+	partitionOps := make(map[int][]transaction.Operation)
+	for _, op := range t.Operations {
+		partition := ps.getPartition(op.Key)
+		idx := -1
+		for i, p := range ps.partitions {
+			if p == partition {
+				idx = i
+			}
+		}
+
+		partitionOps[idx] = append(partitionOps[idx], op)
+	}
+
+	// 
+
+}
+
+func (m *MemoryStorage) BatchPut(entries []types.Entry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, entry := range entries {
+		m.data[string(entry.Key)] = entry
+	}
+
+	return nil
+}
+
 func (ps *PartitionedStorage) Get(key types.Key) (types.Value, error) {
 	return ps.getPartition(key).Get(key)
 }
@@ -58,7 +88,7 @@ func (ps *PartitionedStorage) Put(key types.Key, value types.Value) error {
 	return ps.getPartition(key).Put(key, value)
 }
 
-func (ps *PartitionedStorage) Delte(key types.Key) error {
+func (ps *PartitionedStorage) Delete(key types.Key) error {
 	return ps.getPartition(key).Delete(key)
 }
 
@@ -75,7 +105,7 @@ func (m *MemoryStorage) Get(key types.Key) (types.Value, error) {
 }
 
 func (m *MemoryStorage) Put(key types.Key, value types.Value) error {
-	m.mu.RLock()
+	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.data[string(key)] = types.Entry{
@@ -100,23 +130,22 @@ func (m *MemoryStorage) Delete(key types.Key) error {
 	return nil
 }
 
-func (m *MemoryStorage) ExecuteTransaction(txn *transaction.Transaction) error {
-	// Phase 1: Prepare
+func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
+	// Phase 1: Prep
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, op := range txn.Operations {
-		if op.Type == types.Put {
-			// Check if the key is locked by another transaction
-			if _, ok := m.locks[string(op.Key)]; ok {
-				txn.Status = transaction.Aborted
-				return errors.New("key is locked")
-			}
-			m.locks[string(op.Key)] = struct{}{}
+
+	for _, op := range t.Operations {
+		// Check if key is locked by another op
+		if _, ok := m.locks[string(op.Key)]; ok {
+			t.Status = transaction.Aborted
+			return errors.New("key is locked")
 		}
+		m.locks[string(op.Key)] = struct{}{}
 	}
 
 	// Phase 2: Commit
-	for _, op := range txn.Operations {
+	for _, op := range t.Operations {
 		switch op.Type {
 		case types.Put:
 			m.data[string(op.Key)] = types.Entry{
@@ -124,11 +153,12 @@ func (m *MemoryStorage) ExecuteTransaction(txn *transaction.Transaction) error {
 				Value:     op.Value,
 				Timestamp: time.Now(),
 			}
+
 		case types.Delete:
 			delete(m.data, string(op.Key))
 		}
-		delete(m.locks, string(op.Key))
 	}
-	txn.Status = transaction.Committed
+	t.Status = transaction.Committed
+
 	return nil
 }
