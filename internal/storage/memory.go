@@ -65,7 +65,18 @@ func (ps *PartitionedStorage) ExecuteTransaction(t *transaction.Transaction) err
 		partitionOps[idx] = append(partitionOps[idx], op)
 	}
 
-	// 
+	// Execute transaction on each partition
+	for i, ops := range partitionOps {
+		partitionTxn := &transaction.Transaction{Operations: ops}
+		err := ps.partitions[i].ExecuteTransaction(partitionTxn)
+		if err != nil {
+			return err
+		}
+	}
+
+	t.Status = transaction.Committed
+
+	return nil
 
 }
 
@@ -159,6 +170,11 @@ func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
 		}
 	}
 	t.Status = transaction.Committed
+
+	// Cleanup: Release locks
+	for _, op := range t.Operations {
+		delete(m.locks, string(op.Key))
+	}
 
 	return nil
 }

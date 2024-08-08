@@ -3,8 +3,10 @@ package log
 import (
 	"encoding/binary"
 	"os"
+	"io"
 
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
+	"github.com/sdrshn-nmbr/bulletant/internal/storage"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
@@ -67,3 +69,76 @@ func (w *WAL) LogTransaction(t *transaction.Transaction) error {
 }
 
 // ! Implement recovery method
+func (w *WAL) Recover(storage storage.Storage) error {
+	_, err := w.file.Seek(0, 0)
+	if err != nil {
+		return err
+	}
+
+	for {
+		t, err := w.readTransaction()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		err = storage.ExecuteTransaction(t)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (w *WAL) readTransaction() (*transaction.Transaction, error) {
+	var numOps uint32
+	err := binary.Read(w.file, binary.LittleEndian, &numOps)
+	if err != nil {
+		return nil, err
+	}
+
+	t := transaction.NewTransaction()
+
+	for i := uint32(0); i < numOps; i++ {
+		var opType uint8
+		err = binary.Read(w.file, binary.LittleEndian, &opType)
+		if err != nil {
+			return nil, err
+		}
+
+		var keyLen uint32
+		err = binary.Read(w.file, binary.LittleEndian, &keyLen)
+		if err != nil {
+			return nil, err
+		}
+
+		key := make([]byte, keyLen)
+		_, err = w.file.Read(key)
+		if err != nil {
+			return nil, err
+		}
+
+		if types.OperationType(opType) == types.Put {
+			var valueLen uint32
+			err = binary.Read(w.file, binary.LittleEndian, &valueLen)
+			if err != nil {
+				return nil, err
+			}
+
+			value := make([]byte, valueLen)
+			_, err = w.file.Read(value)
+			if err != nil {
+				return nil, err
+			}
+
+			t.Put(types.Key(key), types.Value(value))
+		} else if types.OperationType(opType) == types.Delete {
+			t.Delete(types.Key(key))
+		}
+	}
+
+	return t, nil
+}

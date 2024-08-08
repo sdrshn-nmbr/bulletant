@@ -1,4 +1,4 @@
-package main
+package client
 
 import (
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
@@ -7,28 +7,29 @@ import (
 )
 
 type Client struct {
-	storage storage.Storage
+	Storage storage.Storage
 }
 
 func NewClient(storage storage.Storage) *Client {
-	return &Client{storage: storage}
+	return &Client{Storage: storage}
 }
 
 func (c *Client) Get(key []byte) ([]byte, error) {
-	return c.storage.Get(types.Key(key))
+	return c.Storage.Get(types.Key(key))
 }
 
 func (c *Client) Put(key []byte, val []byte) error {
-	return c.storage.Put(types.Key(key), types.Value(val))
+	return c.Storage.Put(types.Key(key), types.Value(val))
 }
 
 func (c *Client) Delete(key []byte) error {
-	return c.storage.Delete(types.Key(key))
+	return c.Storage.Delete(types.Key(key))
 }
 
-func (c *Client) Transaction(fn func(*transaction.Transaction)) error {
+func (c *Client) Transaction(fn func(*transaction.Transaction)) (transaction.TransactionStatus, error) {
 	txn := transaction.NewTransaction()
 	fn(txn)
 
-	return c.storage.ExecuteTransaction(txn)
+	err := c.Storage.ExecuteTransaction(txn)
+	return txn.Status, err
 }

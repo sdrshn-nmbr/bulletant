@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 	"golang.org/x/exp/mmap"
 )
@@ -42,6 +43,31 @@ func NewDiskStorage(filename string) (*DiskStorage, error) {
 		mmap: mmapFile,
 		size: info.Size(),
 	}, nil
+}
+
+func (d *DiskStorage) ExecuteTransaction(t *transaction.Transaction) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for _, op := range t.Operations {
+		switch op.Type {
+		case types.Put:
+			err := d.Put(op.Key, op.Value)
+			if err != nil {
+				t.Status = transaction.Aborted
+				return err
+			}
+		case types.Delete:
+			err := d.Delete(op.Key)
+			if err != nil {
+				t.Status = transaction.Aborted
+				return err
+			}
+		}
+	}
+
+	t.Status = transaction.Committed
+	return nil
 }
 
 func (d *DiskStorage) Put(key types.Key, value types.Value) error {
