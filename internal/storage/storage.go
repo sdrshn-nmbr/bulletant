@@ -72,14 +72,12 @@ func (vs *VectorStore) DeleteVector(id string) error {
 
 // StorageImpl represents the combined key-value and vector storage
 type StorageImpl struct {
-	// ... existing fields ...
 	VectorStore *VectorStore
 }
 
 // NewStorage function to initialize StorageImpl
 func NewStorage() *StorageImpl {
 	return &StorageImpl{
-		// ... existing initializations ...
 		VectorStore: NewVectorStore(),
 	}
 }
