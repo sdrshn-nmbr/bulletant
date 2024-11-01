@@ -1,9 +1,6 @@
 package client
 
 import (
-	"encoding/json"
-	"errors"
-
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"

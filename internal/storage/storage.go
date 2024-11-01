@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"encoding/json"
 	"errors"
 	"sync"
 
@@ -9,6 +8,17 @@ import (
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
+
+// Storage interface defines all storage operations
+type Storage interface {
+	Get(key types.Key) (types.Value, error)
+	Put(key types.Key, value types.Value) error
+	Delete(key types.Key) error
+	ExecuteTransaction(t *transaction.Transaction) error
+	AddVector(values []float64, metadata map[string]interface{}) (string, error)
+	GetVector(id string) (*Vector, error)
+	DeleteVector(id string) error
+}
 
 // Vector represents a vector in the database
 type Vector struct {
@@ -68,43 +78,4 @@ func (vs *VectorStore) DeleteVector(id string) error {
 	}
 	delete(vs.vectors, id)
 	return nil
-}
-
-// StorageImpl represents the combined key-value and vector storage
-type StorageImpl struct {
-	VectorStore *VectorStore
-}
-
-// NewStorage function to initialize StorageImpl
-func NewStorage() *StorageImpl {
-	return &StorageImpl{
-		VectorStore: NewVectorStore(),
-	}
-}
-
-// Storage interface defines the methods for both key-value and vector operations
-type Storage interface {
-	Get(key types.Key) (types.Value, error)
-	Put(key types.Key, value types.Value) error
-	Delete(key types.Key) error
-	ExecuteTransaction(t *transaction.Transaction) error
-	AddVector(values []float64, metadata map[string]interface{}) (string, error)
-	GetVector(id string) (*Vector, error)
-	DeleteVector(id string) error
-}
-
-// Ensure StorageImpl implements Storage interface
-var _ Storage = (*StorageImpl)(nil)
-
-// Implement the new vector methods for StorageImpl
-func (s *StorageImpl) AddVector(values []float64, metadata map[string]interface{}) (string, error) {
-	return s.VectorStore.AddVector(values, metadata)
-}
-
-func (s *StorageImpl) GetVector(id string) (*Vector, error) {
-	return s.VectorStore.GetVector(id)
-}
-
-func (s *StorageImpl) DeleteVector(id string) error {
-	return s.VectorStore.DeleteVector(id)
 }

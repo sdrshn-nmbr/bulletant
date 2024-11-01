@@ -2,11 +2,11 @@ package log
 
 import (
 	"encoding/binary"
-	"os"
 	"io"
+	"os"
 
-	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
+	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 

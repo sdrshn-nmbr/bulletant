@@ -11,9 +11,10 @@ import (
 )
 
 type MemoryStorage struct {
-	data  map[string]types.Entry
-	locks map[string]struct{}
-	mu    sync.RWMutex
+	data        map[string]types.Entry
+	locks       map[string]struct{}
+	mu          sync.RWMutex
+	vectorStore *VectorStore
 }
 
 type PartitionedStorage struct {
@@ -23,9 +24,23 @@ type PartitionedStorage struct {
 
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
-		data:  make(map[string]types.Entry),
-		locks: make(map[string]struct{}),
+		data:        make(map[string]types.Entry),
+		locks:       make(map[string]struct{}),
+		vectorStore: NewVectorStore(),
 	}
+}
+
+// Vector operations
+func (m *MemoryStorage) AddVector(values []float64, metadata map[string]interface{}) (string, error) {
+	return m.vectorStore.AddVector(values, metadata)
+}
+
+func (m *MemoryStorage) GetVector(id string) (*Vector, error) {
+	return m.vectorStore.GetVector(id)
+}
+
+func (m *MemoryStorage) DeleteVector(id string) error {
+	return m.vectorStore.DeleteVector(id)
 }
 
 // ! The partitioned approach reduces contention by spreading the locks across multiple partitions

@@ -264,3 +264,15 @@ func uint32ToBytes(u uint32) []byte {
 	binary.LittleEndian.PutUint32(b, u)
 	return b
 }
+
+func (d *DiskStorage) AddVector(values []float64, metadata map[string]interface{}) (string, error) {
+	return "", errors.New("vector operations not supported in disk storage")
+}
+
+func (d *DiskStorage) GetVector(id string) (*Vector, error) {
+	return nil, errors.New("vector operations not supported in disk storage")
+}
+
+func (d *DiskStorage) DeleteVector(id string) error {
+	return errors.New("vector operations not supported in disk storage")
+}
