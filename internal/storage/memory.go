@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"hash/fnv"
 	"sync"
 	"time"
@@ -12,7 +11,6 @@ import (
 
 type MemoryStorage struct {
 	data        map[string]types.Entry
-	locks       map[string]struct{}
 	mu          sync.RWMutex
 	vectorStore *VectorStore
 }
@@ -20,12 +18,12 @@ type MemoryStorage struct {
 type PartitionedStorage struct {
 	partitions    []*MemoryStorage
 	numPartitions int
+	vectorStore   *VectorStore
 }
 
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
 		data:        make(map[string]types.Entry),
-		locks:       make(map[string]struct{}),
 		vectorStore: NewVectorStore(),
 	}
 }
@@ -48,6 +46,7 @@ func NewPartitionedStorage(numPartitions int) *PartitionedStorage {
 	ps := &PartitionedStorage{
 		partitions:    make([]*MemoryStorage, numPartitions),
 		numPartitions: numPartitions,
+		vectorStore:   NewVectorStore(),
 	}
 
 	for i := 0; i < numPartitions; i++ {
@@ -58,25 +57,21 @@ func NewPartitionedStorage(numPartitions int) *PartitionedStorage {
 }
 
 func (ps *PartitionedStorage) getPartition(key types.Key) *MemoryStorage {
+	partitionIdx := ps.getPartitionIndex(key)
+	return ps.partitions[partitionIdx]
+}
+
+func (ps *PartitionedStorage) getPartitionIndex(key types.Key) int {
 	hash := fnv.New32a()
 	hash.Write([]byte(key))
-	partitionIdx := hash.Sum32() % uint32(ps.numPartitions)
-
-	return ps.partitions[partitionIdx]
+	return int(hash.Sum32() % uint32(ps.numPartitions))
 }
 
 func (ps *PartitionedStorage) ExecuteTransaction(t *transaction.Transaction) error {
 	// Group ops by partition
 	partitionOps := make(map[int][]transaction.Operation)
 	for _, op := range t.Operations {
-		partition := ps.getPartition(op.Key)
-		idx := -1
-		for i, p := range ps.partitions {
-			if p == partition {
-				idx = i
-			}
-		}
-
+		idx := ps.getPartitionIndex(op.Key)
 		partitionOps[idx] = append(partitionOps[idx], op)
 	}
 
@@ -85,6 +80,7 @@ func (ps *PartitionedStorage) ExecuteTransaction(t *transaction.Transaction) err
 		partitionTxn := &transaction.Transaction{Operations: ops}
 		err := ps.partitions[i].ExecuteTransaction(partitionTxn)
 		if err != nil {
+			t.Status = transaction.Aborted
 			return err
 		}
 	}
@@ -124,7 +120,7 @@ func (m *MemoryStorage) Get(key types.Key) (types.Value, error) {
 
 	entry, ok := m.data[string(key)]
 	if !ok {
-		return nil, errors.New("key not found")
+		return nil, ErrKeyNotFound
 	}
 
 	return entry.Value, nil
@@ -148,7 +144,7 @@ func (m *MemoryStorage) Delete(key types.Key) error {
 	defer m.mu.Unlock()
 
 	if _, ok := m.data[string(key)]; !ok {
-		return errors.New("key not found")
+		return ErrKeyNotFound
 	}
 
 	delete(m.data, string(key))
@@ -157,20 +153,9 @@ func (m *MemoryStorage) Delete(key types.Key) error {
 }
 
 func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
-	// Phase 1: Prep
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, op := range t.Operations {
-		// Check if key is locked by another op
-		if _, ok := m.locks[string(op.Key)]; ok {
-			t.Status = transaction.Aborted
-			return errors.New("key is locked")
-		}
-		m.locks[string(op.Key)] = struct{}{}
-	}
-
-	// Phase 2: Commit
 	for _, op := range t.Operations {
 		switch op.Type {
 		case types.Put:
@@ -181,15 +166,26 @@ func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
 			}
 
 		case types.Delete:
+			if _, ok := m.data[string(op.Key)]; !ok {
+				t.Status = transaction.Aborted
+				return ErrKeyNotFound
+			}
 			delete(m.data, string(op.Key))
 		}
 	}
 	t.Status = transaction.Committed
-
-	// Cleanup: Release locks
-	for _, op := range t.Operations {
-		delete(m.locks, string(op.Key))
-	}
-
 	return nil
+}
+
+// Vector operations for partitioned storage
+func (ps *PartitionedStorage) AddVector(values []float64, metadata map[string]interface{}) (string, error) {
+	return ps.vectorStore.AddVector(values, metadata)
+}
+
+func (ps *PartitionedStorage) GetVector(id string) (*Vector, error) {
+	return ps.vectorStore.GetVector(id)
+}
+
+func (ps *PartitionedStorage) DeleteVector(id string) error {
+	return ps.vectorStore.DeleteVector(id)
 }

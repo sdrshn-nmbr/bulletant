@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"sync"
 
 	"github.com/google/uuid"
@@ -63,7 +62,7 @@ func (vs *VectorStore) GetVector(id string) (*Vector, error) {
 
 	vector, ok := vs.vectors[id]
 	if !ok {
-		return nil, errors.New("vector not found")
+		return nil, ErrVectorNotFound
 	}
 	return vector, nil
 }
@@ -74,7 +73,7 @@ func (vs *VectorStore) DeleteVector(id string) error {
 	defer vs.mu.Unlock()
 
 	if _, ok := vs.vectors[id]; !ok {
-		return errors.New("vector not found")
+		return ErrVectorNotFound
 	}
 	delete(vs.vectors, id)
 	return nil

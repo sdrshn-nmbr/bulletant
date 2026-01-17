@@ -2,16 +2,20 @@ package log
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 
-	"github.com/sdrshn-nmbr/bulletant/internal/storage"
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
 type WAL struct {
 	file *os.File
+}
+
+type TransactionApplier interface {
+	ExecuteTransaction(t *transaction.Transaction) error
 }
 
 func NewWAL(filename string) (*WAL, error) {
@@ -28,11 +32,18 @@ func (w *WAL) LogTransaction(t *transaction.Transaction) error {
 	// Format: [number of ops (uint32)][op type (types.OperationType)][key length (uint32)][key (types.Key)][value length (uint32)][value (types.Value)]
 
 	// [number of ops (uint32)]
-	if err := binary.Write(w.file, binary.LittleEndian, uint32(len(t.Operations))); err != nil {
+	logOps := make([]transaction.Operation, 0, len(t.Operations))
+	for _, op := range t.Operations {
+		if op.Type == types.Put || op.Type == types.Delete {
+			logOps = append(logOps, op)
+		}
+	}
+
+	if err := binary.Write(w.file, binary.LittleEndian, uint32(len(logOps))); err != nil {
 		return err
 	}
 
-	for _, op := range t.Operations {
+	for _, op := range logOps {
 		// Only 1 (Put) or 2 (Delete) written, as they actually change the data
 		if op.Type == types.Put || op.Type == types.Delete {
 			// [op type (types.OperationType)]
@@ -69,7 +80,7 @@ func (w *WAL) LogTransaction(t *transaction.Transaction) error {
 }
 
 // ! Implement recovery method
-func (w *WAL) Recover(storage storage.Storage) error {
+func (w *WAL) Recover(applier TransactionApplier) error {
 	_, err := w.file.Seek(0, 0)
 	if err != nil {
 		return err
@@ -84,7 +95,7 @@ func (w *WAL) Recover(storage storage.Storage) error {
 			return err
 		}
 
-		err = storage.ExecuteTransaction(t)
+		err = applier.ExecuteTransaction(t)
 		if err != nil {
 			return err
 		}
@@ -116,8 +127,7 @@ func (w *WAL) readTransaction() (*transaction.Transaction, error) {
 		}
 
 		key := make([]byte, keyLen)
-		_, err = w.file.Read(key)
-		if err != nil {
+		if _, err := io.ReadFull(w.file, key); err != nil {
 			return nil, err
 		}
 
@@ -129,16 +139,24 @@ func (w *WAL) readTransaction() (*transaction.Transaction, error) {
 			}
 
 			value := make([]byte, valueLen)
-			_, err = w.file.Read(value)
-			if err != nil {
+			if _, err := io.ReadFull(w.file, value); err != nil {
 				return nil, err
 			}
 
 			t.Put(types.Key(key), types.Value(value))
 		} else if types.OperationType(opType) == types.Delete {
 			t.Delete(types.Key(key))
+		} else {
+			return nil, fmt.Errorf("invalid op type %d in WAL", opType)
 		}
 	}
 
 	return t, nil
+}
+
+func (w *WAL) Close() error {
+	if w.file == nil {
+		return nil
+	}
+	return w.file.Close()
 }
