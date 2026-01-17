@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
@@ -30,7 +31,7 @@ func TestMemoryStorage(t *testing.T) {
 	}
 
 	_, err = store.Get(types.Key("key1"))
-	if err == nil {
-		t.Fatalf("Expected error after delete, got nil")
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Expected ErrKeyNotFound after delete, got %v", err)
 	}
 }

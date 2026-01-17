@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"github.com/google/uuid"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
@@ -18,13 +19,28 @@ const (
 	Aborted
 )
 
+func (s TransactionStatus) String() string {
+	switch s {
+	case Pending:
+		return "pending"
+	case Committed:
+		return "committed"
+	case Aborted:
+		return "aborted"
+	default:
+		return "unknown"
+	}
+}
+
 type Transaction struct {
+	ID         uuid.UUID
 	Operations []Operation
 	Status     TransactionStatus
 }
 
 func NewTransaction() *Transaction {
 	return &Transaction{
+		ID:         uuid.New(),
 		Operations: make([]Operation, 0),
 		Status:     Pending,
 	}

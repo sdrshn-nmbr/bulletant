@@ -45,3 +45,7 @@ func (c *Client) GetVector(id string) (*storage.Vector, error) {
 func (c *Client) DeleteVector(id string) error {
 	return c.Storage.DeleteVector(id)
 }
+
+func (c *Client) Close() error {
+	return c.Storage.Close()
+}
