@@ -3,7 +3,10 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
@@ -156,6 +159,53 @@ func (d *DiskStorage) Delete(key types.Key) error {
 	return d.deleteLocked(key)
 }
 
+func (d *DiskStorage) Scan(req ScanRequest) (ScanResult, error) {
+	if err := req.Validate(); err != nil {
+		return ScanResult{}, err
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	keys := d.scanKeys(req.Prefix)
+	sort.Strings(keys)
+
+	start := scanStartIndex(keys, string(req.Cursor))
+	if start >= len(keys) {
+		return ScanResult{Entries: []ScanEntry{}}, nil
+	}
+
+	limit := int(req.Limit)
+	end := start + limit
+	if end > len(keys) {
+		end = len(keys)
+	}
+
+	entries := make([]ScanEntry, 0, end-start)
+	for _, key := range keys[start:end] {
+		entry := d.index[key]
+		scanEntry := ScanEntry{Key: types.Key(key)}
+		if req.IncludeValues {
+			value, err := d.readValue(entry, req)
+			if err != nil {
+				return ScanResult{}, err
+			}
+			scanEntry.Value = value
+		}
+		entries = append(entries, scanEntry)
+	}
+
+	nextCursor := types.Key("")
+	if end < len(keys) {
+		nextCursor = types.Key(keys[end-1])
+	}
+
+	return ScanResult{
+		Entries:    entries,
+		NextCursor: nextCursor,
+	}, nil
+}
+
 func (d *DiskStorage) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -178,6 +228,69 @@ func (d *DiskStorage) GetVector(id string) (*Vector, error) {
 
 func (d *DiskStorage) DeleteVector(id string) error {
 	return ErrUnsupported
+}
+
+func (d *DiskStorage) Compact(opts CompactOptions) (CompactStats, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	stats := CompactStats{
+		BytesBefore: uint64(d.size),
+	}
+
+	if err := d.validateCompactOptions(&opts); err != nil {
+		return stats, err
+	}
+
+	keys := d.scanKeys(types.Key(""))
+	sort.Strings(keys)
+
+	if len(keys) > int(^uint32(0)) {
+		return stats, ErrInvalidCompactLimit
+	}
+	stats.EntriesTotal = uint32(len(keys))
+	if stats.EntriesTotal > opts.MaxEntries {
+		return stats, ErrCompactLimitExceeded
+	}
+
+	estimatedBytes, err := d.compactEstimatedBytes(keys)
+	if err != nil {
+		return stats, err
+	}
+	if estimatedBytes > opts.MaxBytes {
+		return stats, ErrCompactLimitExceeded
+	}
+
+	tempPath := opts.TempPath
+	if tempPath == "" {
+		tempPath = d.defaultCompactPath()
+	}
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	newIndex := make(map[string]diskIndexEntry, len(keys))
+	entriesWritten, bytesWritten, err := d.writeCompactFile(
+		tempPath,
+		keys,
+		newIndex,
+	)
+	if err != nil {
+		return stats, err
+	}
+
+	stats.EntriesWritten = entriesWritten
+	stats.BytesAfter = bytesWritten
+
+	if err := d.swapCompactFile(tempPath, newIndex); err != nil {
+		return stats, err
+	}
+	cleanupTemp = false
+
+	return stats, nil
 }
 
 func (d *DiskStorage) putLocked(key types.Key, value types.Value) error {
@@ -271,6 +384,28 @@ func (d *DiskStorage) entrySize(op types.OperationType, key []byte, value []byte
 		return 1 + 4 + len(key) + 4 + len(value)
 	}
 	return 4 + len(key) + 4 + len(value)
+}
+
+func (d *DiskStorage) entrySizeForFormat(
+	format diskFormat,
+	key []byte,
+	value []byte,
+) int {
+	if format == diskFormatV1 {
+		return 1 + 4 + len(key) + 4 + len(value)
+	}
+	return 4 + len(key) + 4 + len(value)
+}
+
+func (d *DiskStorage) entrySizeForFormatLen(
+	format diskFormat,
+	keyLen int,
+	valueLen int,
+) int {
+	if format == diskFormatV1 {
+		return 1 + 4 + keyLen + 4 + valueLen
+	}
+	return 4 + keyLen + 4 + valueLen
 }
 
 func (d *DiskStorage) initFormat() error {
@@ -412,6 +547,226 @@ func (d *DiskStorage) remapFile() error {
 	}
 	d.mmap = mmapFile
 	return nil
+}
+
+func (d *DiskStorage) scanKeys(prefix types.Key) []string {
+	keys := make([]string, 0, len(d.index))
+	for key, entry := range d.index {
+		if entry.deleted {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return filterKeys(keys, string(prefix))
+}
+
+func (d *DiskStorage) readValue(
+	entry diskIndexEntry,
+	req ScanRequest,
+) (types.Value, error) {
+	maxInt := int(^uint(0) >> 1)
+	if entry.valueLen > uint32(maxInt) {
+		return nil, ErrValueTooLarge
+	}
+	if entry.valueLen > req.MaxValueBytes {
+		return nil, ErrValueTooLarge
+	}
+	if entry.valueLen == 0 {
+		return []byte{}, nil
+	}
+
+	value := make([]byte, entry.valueLen)
+	if _, err := d.readAt(value, entry.offset); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func (d *DiskStorage) validateCompactOptions(opts *CompactOptions) error {
+	if opts.MaxEntries == 0 {
+		return ErrInvalidCompactLimit
+	}
+	if opts.MaxBytes == 0 {
+		return ErrInvalidCompactLimit
+	}
+	return nil
+}
+
+func (d *DiskStorage) compactEstimatedBytes(keys []string) (uint64, error) {
+	total := uint64(diskHeaderSize)
+	for _, key := range keys {
+		entry := d.index[key]
+		keyBytes := []byte(key)
+		maxInt := int(^uint(0) >> 1)
+		if entry.valueLen > uint32(maxInt) {
+			return 0, ErrValueTooLarge
+		}
+		valueLen := int(entry.valueLen)
+		size := d.entrySizeForFormatLen(
+			diskFormatV1,
+			len(keyBytes),
+			valueLen,
+		)
+		total += uint64(size)
+	}
+	return total, nil
+}
+
+func (d *DiskStorage) writeCompactFile(
+	path string,
+	keys []string,
+	newIndex map[string]diskIndexEntry,
+) (uint32, uint64, error) {
+	tempFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tempFile.Close()
+
+	if err := d.writeCompactHeader(tempFile); err != nil {
+		return 0, 0, err
+	}
+
+	offset := int64(diskHeaderSize)
+	var entriesWritten uint32
+	for _, key := range keys {
+		entry := d.index[key]
+		value, err := d.readValue(entry, ScanRequest{
+			Limit:         1,
+			IncludeValues: true,
+			MaxValueBytes: entry.valueLen,
+		})
+		if err != nil {
+			return 0, 0, err
+		}
+
+		keyBytes := []byte(key)
+		entrySize := d.entrySizeForFormat(diskFormatV1, keyBytes, value)
+
+		written, valueOffset, err := d.writeEntryTo(
+			tempFile,
+			offset,
+			keyBytes,
+			value,
+		)
+		if err != nil {
+			return 0, 0, err
+		}
+		offset += int64(written)
+		entriesWritten++
+
+		newIndex[key] = diskIndexEntry{
+			offset:   valueOffset,
+			valueLen: uint32(len(value)),
+			deleted:  false,
+		}
+
+		if written != entrySize {
+			return 0, 0, io.ErrShortWrite
+		}
+	}
+
+	if err := tempFile.Sync(); err != nil {
+		return 0, 0, err
+	}
+
+	return entriesWritten, uint64(offset), nil
+}
+
+func (d *DiskStorage) writeCompactHeader(file *os.File) error {
+	header := append([]byte(diskMagic), byte(diskFormatV1))
+	_, err := file.WriteAt(header, 0)
+	return err
+}
+
+func (d *DiskStorage) writeEntryTo(
+	file *os.File,
+	offset int64,
+	key []byte,
+	value []byte,
+) (int, int64, error) {
+	start := offset
+	if _, err := file.WriteAt([]byte{byte(types.Put)}, offset); err != nil {
+		return 0, 0, err
+	}
+	offset++
+
+	if _, err := file.WriteAt(uint32ToBytes(uint32(len(key))), offset); err != nil {
+		return 0, 0, err
+	}
+	offset += 4
+
+	if _, err := file.WriteAt(key, offset); err != nil {
+		return 0, 0, err
+	}
+	offset += int64(len(key))
+
+	if _, err := file.WriteAt(uint32ToBytes(uint32(len(value))), offset); err != nil {
+		return 0, 0, err
+	}
+	offset += 4
+
+	valueOffset := offset
+	if len(value) > 0 {
+		if _, err := file.WriteAt(value, offset); err != nil {
+			return 0, 0, err
+		}
+		offset += int64(len(value))
+	}
+
+	return int(offset - start), valueOffset, nil
+}
+
+func (d *DiskStorage) swapCompactFile(
+	tempPath string,
+	newIndex map[string]diskIndexEntry,
+) error {
+	originalPath := d.file.Name()
+	backupPath := filepath.Join(
+		filepath.Dir(originalPath),
+		filepath.Base(originalPath)+".bak",
+	)
+
+	if err := d.closeLocked(); err != nil {
+		return err
+	}
+
+	_ = os.Remove(backupPath)
+	if err := os.Rename(originalPath, backupPath); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, originalPath); err != nil {
+		_ = os.Rename(backupPath, originalPath)
+		return err
+	}
+	_ = os.Remove(backupPath)
+
+	file, err := os.OpenFile(originalPath, os.O_RDWR, 0666)
+	if err != nil {
+		return err
+	}
+
+	d.file = file
+	d.index = newIndex
+	d.format = diskFormatV1
+	d.dataOffset = diskHeaderSize
+
+	return d.remapFile()
+}
+
+func (d *DiskStorage) closeLocked() error {
+	if d.mmap != nil {
+		if err := d.mmap.Close(); err != nil {
+			return err
+		}
+		d.mmap = nil
+	}
+	return d.file.Close()
+}
+
+func (d *DiskStorage) defaultCompactPath() string {
+	path := d.file.Name()
+	return path + ".compact"
 }
 
 func (d *DiskStorage) readAt(p []byte, off int64) (int, error) {

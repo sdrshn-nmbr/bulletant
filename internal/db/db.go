@@ -52,6 +52,10 @@ func (d *DB) Delete(key []byte) error {
 	return d.ExecuteTransaction(txn)
 }
 
+func (d *DB) Scan(req storage.ScanRequest) (storage.ScanResult, error) {
+	return d.storage.Scan(req)
+}
+
 func (d *DB) Transaction(fn func(*transaction.Transaction)) (transaction.TransactionStatus, error) {
 	txn := transaction.NewTransaction()
 	fn(txn)
@@ -97,6 +101,14 @@ func (d *DB) GetVector(id string) (*storage.Vector, error) {
 
 func (d *DB) DeleteVector(id string) error {
 	return d.storage.DeleteVector(id)
+}
+
+func (d *DB) Compact(opts storage.CompactOptions) (storage.CompactStats, error) {
+	compacter, ok := d.storage.(storage.Compacter)
+	if !ok {
+		return storage.CompactStats{}, storage.ErrUnsupported
+	}
+	return compacter.Compact(opts)
 }
 
 func (d *DB) Close() error {

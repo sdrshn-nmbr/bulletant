@@ -14,6 +14,7 @@ type Storage interface {
 	Put(key types.Key, value types.Value) error
 	Delete(key types.Key) error
 	ExecuteTransaction(t *transaction.Transaction) error
+	Scan(req ScanRequest) (ScanResult, error)
 	AddVector(values []float64, metadata map[string]interface{}) (string, error)
 	GetVector(id string) (*Vector, error)
 	DeleteVector(id string) error
