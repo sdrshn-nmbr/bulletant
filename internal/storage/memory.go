@@ -2,6 +2,7 @@ package storage
 
 import (
 	"hash/fnv"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,6 +122,25 @@ func (ps *PartitionedStorage) Delete(key types.Key) error {
 	return ps.getPartition(key).Delete(key)
 }
 
+func (ps *PartitionedStorage) Scan(req ScanRequest) (ScanResult, error) {
+	if err := req.Validate(); err != nil {
+		return ScanResult{}, err
+	}
+
+	entries := make([]ScanEntry, 0)
+	for _, partition := range ps.partitions {
+		partition.mu.RLock()
+		partEntries, err := collectScanEntries(partition.data, req)
+		partition.mu.RUnlock()
+		if err != nil {
+			return ScanResult{}, err
+		}
+		entries = append(entries, partEntries...)
+	}
+
+	return buildScanResult(entries, req), nil
+}
+
 func (ps *PartitionedStorage) AddVector(values []float64, metadata map[string]interface{}) (string, error) {
 	return ps.vectorStore.AddVector(values, metadata)
 }
@@ -169,6 +189,21 @@ func (m *MemoryStorage) Delete(key types.Key) error {
 	delete(m.data, string(key))
 
 	return nil
+}
+
+func (m *MemoryStorage) Scan(req ScanRequest) (ScanResult, error) {
+	if err := req.Validate(); err != nil {
+		return ScanResult{}, err
+	}
+
+	m.mu.RLock()
+	entries, err := collectScanEntries(m.data, req)
+	m.mu.RUnlock()
+	if err != nil {
+		return ScanResult{}, err
+	}
+
+	return buildScanResult(entries, req), nil
 }
 
 func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
@@ -220,4 +255,37 @@ func (ps *PartitionedStorage) Close() error {
 		}
 	}
 	return nil
+}
+
+func collectScanEntries(
+	data map[string]types.Entry,
+	req ScanRequest,
+) ([]ScanEntry, error) {
+	entries := make([]ScanEntry, 0, len(data))
+	prefix := string(req.Prefix)
+
+	for key, entry := range data {
+		if prefix != "" {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+		}
+		if req.IncludeValues {
+			valueLen := uint32(len(entry.Value))
+			if valueLen > req.MaxValueBytes {
+				return nil, ErrValueTooLarge
+			}
+			valueCopy := append([]byte(nil), entry.Value...)
+			entries = append(entries, ScanEntry{
+				Key:   types.Key(key),
+				Value: valueCopy,
+			})
+			continue
+		}
+		entries = append(entries, ScanEntry{
+			Key: types.Key(key),
+		})
+	}
+
+	return entries, nil
 }

@@ -82,3 +82,52 @@ func TestDiskStorageReopen(t *testing.T) {
 		t.Fatalf("Expected one, got %s", string(value))
 	}
 }
+
+func TestDiskStorageCompact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bulletant.db")
+
+	store, err := NewDiskStorage(path)
+	if err != nil {
+		t.Fatalf("NewDiskStorage failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Put(types.Key("alpha"), []byte("one")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Put(types.Key("alpha"), []byte("two")); err != nil {
+		t.Fatalf("Put update failed: %v", err)
+	}
+	if err := store.Put(types.Key("beta"), []byte("three")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Delete(types.Key("beta")); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	bytesBefore := uint64(store.size)
+	stats, err := store.Compact(CompactOptions{
+		MaxEntries: 8,
+		MaxBytes:   bytesBefore,
+	})
+	if err != nil {
+		t.Fatalf("Compact failed: %v", err)
+	}
+	if stats.BytesAfter > stats.BytesBefore {
+		t.Fatalf("Expected compaction to shrink or keep size")
+	}
+
+	value, err := store.Get(types.Key("alpha"))
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if string(value) != "two" {
+		t.Fatalf("Expected two, got %s", string(value))
+	}
+
+	_, err = store.Get(types.Key("beta"))
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Expected ErrKeyNotFound, got %v", err)
+	}
+}

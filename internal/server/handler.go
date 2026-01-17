@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sdrshn-nmbr/bulletant/internal/db"
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
@@ -15,7 +17,12 @@ import (
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
-const maxBodyBytes = 10 << 20
+const (
+	maxBodyBytes       = 10 << 20
+	maxScanEntries     = 10_000
+	maxScanValueBytes  = 8 << 20
+	maxScanPageEntries = 256
+)
 
 type handler struct {
 	db *db.DB
@@ -26,10 +33,18 @@ type kvRequest struct {
 	Encoding string `json:"encoding,omitempty"`
 }
 
+type kvEnvelope struct {
+	Key          string `json:"key"`
+	Value        string `json:"value,omitempty"`
+	KeyEncoding  string `json:"key_encoding,omitempty"`
+	ValueEncoding string `json:"value_encoding,omitempty"`
+}
+
 type kvResponse struct {
 	Key      string `json:"key"`
 	Value    string `json:"value"`
 	Encoding string `json:"encoding"`
+	KeyEncoding string `json:"key_encoding,omitempty"`
 }
 
 type txnRequest struct {
@@ -39,6 +54,7 @@ type txnRequest struct {
 type txnOperation struct {
 	Type     string `json:"type"`
 	Key      string `json:"key"`
+	KeyEncoding string `json:"key_encoding,omitempty"`
 	Value    string `json:"value,omitempty"`
 	Encoding string `json:"encoding,omitempty"`
 }
@@ -58,15 +74,50 @@ type vectorResponse struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
+type scanEntryResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+}
+
+type scanResponse struct {
+	Entries       []scanEntryResponse `json:"entries"`
+	NextCursor    string              `json:"next_cursor,omitempty"`
+	KeyEncoding   string              `json:"key_encoding"`
+	ValueEncoding string              `json:"value_encoding,omitempty"`
+}
+
+type scanStreamInfo struct {
+	Type          string `json:"type"`
+	NextCursor    string `json:"next_cursor,omitempty"`
+	KeyEncoding   string `json:"key_encoding"`
+	ValueEncoding string `json:"value_encoding,omitempty"`
+}
+
+type compactRequest struct {
+	MaxEntries uint32 `json:"max_entries"`
+	MaxBytes   uint64 `json:"max_bytes"`
+	TempPath   string `json:"temp_path,omitempty"`
+}
+
+type compactResponse struct {
+	EntriesTotal   uint32 `json:"entries_total"`
+	EntriesWritten uint32 `json:"entries_written"`
+	BytesBefore    uint64 `json:"bytes_before"`
+	BytesAfter     uint64 `json:"bytes_after"`
+}
+
 func NewHandler(db *db.DB) http.Handler {
 	h := &handler{db: db}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.handleRoot)
 	mux.HandleFunc("/healthz", h.handleHealth)
+	mux.HandleFunc("/kv", h.handleKVQuery)
 	mux.HandleFunc("/kv/", h.handleKV)
+	mux.HandleFunc("/scan", h.handleScan)
 	mux.HandleFunc("/txn", h.handleTxn)
 	mux.HandleFunc("/vectors", h.handleVectors)
 	mux.HandleFunc("/vectors/", h.handleVectorByID)
+	mux.HandleFunc("/maintenance/compact", h.handleCompact)
 	return mux
 }
 
@@ -108,6 +159,7 @@ func (h *handler) handleKV(w http.ResponseWriter, r *http.Request) {
 			Key:      key,
 			Value:    base64.StdEncoding.EncodeToString(value),
 			Encoding: "base64",
+			KeyEncoding: "utf-8",
 		})
 	case http.MethodPut, http.MethodPost:
 		value, err := readValue(r)
@@ -122,6 +174,83 @@ func (h *handler) handleKV(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodDelete:
 		if err := h.db.Delete([]byte(key)); err != nil {
+			writeError(w, statusForError(err), err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *handler) handleKVQuery(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		key, keyEncoding, err := readKeyQuery(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		value, err := h.db.Get(key)
+		if err != nil {
+			writeError(w, statusForError(err), err.Error())
+			return
+		}
+		if r.URL.Query().Get("raw") == "1" {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(value)
+			return
+		}
+
+		encoding := queryValueEncoding(r)
+		encodedValue, err := encodeBytes(value, encoding)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		encodedKey, err := encodeBytes(key, keyEncoding)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, kvResponse{
+			Key:         encodedKey,
+			Value:       encodedValue,
+			Encoding:    encoding,
+			KeyEncoding: keyEncoding,
+		})
+	case http.MethodPut, http.MethodPost:
+		var req kvEnvelope
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		key, err := decodeBytes(req.Key, req.KeyEncoding)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		value, err := decodeBytes(req.Value, req.ValueEncoding)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		if err := h.db.Put(key, value); err != nil {
+			writeError(w, statusForError(err), err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		key, _, err := readKeyQuery(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.db.Delete(key); err != nil {
 			writeError(w, statusForError(err), err.Error())
 			return
 		}
@@ -156,16 +285,22 @@ func (h *handler) handleTxn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		key, err := decodeBytes(op.Key, op.KeyEncoding)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
 		switch opType {
 		case types.Put:
-			value, err := decodeValue(op.Value, op.Encoding)
+			value, err := decodeBytes(op.Value, op.Encoding)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			txn.Put(types.Key(op.Key), types.Value(value))
+			txn.Put(types.Key(key), types.Value(value))
 		case types.Delete:
-			txn.Delete(types.Key(op.Key))
+			txn.Delete(types.Key(key))
 		default:
 			writeError(w, http.StatusBadRequest, "only put and delete are supported")
 			return
@@ -179,6 +314,89 @@ func (h *handler) handleTxn(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, txnResponse{
 		Status: txn.Status.String(),
+	})
+}
+
+func (h *handler) handleScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	req, keyEncoding, valueEncoding, stream, err := readScanQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if stream {
+		h.streamScan(w, r, req, keyEncoding, valueEncoding)
+		return
+	}
+
+	result, err := h.db.Scan(req)
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+
+	entries, err := encodeScanEntries(
+		result.Entries,
+		keyEncoding,
+		valueEncoding,
+		req.IncludeValues,
+	)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	nextCursor, err := encodeBytes([]byte(result.NextCursor), keyEncoding)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, scanResponse{
+		Entries:       entries,
+		NextCursor:    nextCursor,
+		KeyEncoding:   keyEncoding,
+		ValueEncoding: valueEncoding,
+	})
+}
+
+func (h *handler) handleCompact(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req compactRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.MaxEntries == 0 || req.MaxBytes == 0 {
+		writeError(w, http.StatusBadRequest, "max_entries and max_bytes are required")
+		return
+	}
+
+	stats, err := h.db.Compact(storage.CompactOptions{
+		MaxEntries: req.MaxEntries,
+		MaxBytes:   req.MaxBytes,
+		TempPath:   req.TempPath,
+	})
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, compactResponse{
+		EntriesTotal:   stats.EntriesTotal,
+		EntriesWritten: stats.EntriesWritten,
+		BytesBefore:    stats.BytesBefore,
+		BytesAfter:     stats.BytesAfter,
 	})
 }
 
@@ -246,7 +464,7 @@ func readValue(r *http.Request) ([]byte, error) {
 		if err := decodeJSON(r, &req); err != nil {
 			return nil, err
 		}
-		return decodeValue(req.Value, req.Encoding)
+		return decodeBytes(req.Value, req.Encoding)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
@@ -256,15 +474,306 @@ func readValue(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-func decodeValue(value string, encoding string) ([]byte, error) {
+func decodeBytes(value string, encoding string) ([]byte, error) {
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
 	case "", "utf-8", "text":
 		return []byte(value), nil
 	case "base64", "b64":
 		return base64.StdEncoding.DecodeString(value)
 	default:
-		return nil, errors.New("unsupported value encoding")
+		return nil, errors.New("unsupported encoding")
 	}
+}
+
+func encodeBytes(value []byte, encoding string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "utf-8", "text":
+		if !utf8.Valid(value) {
+			return "", errors.New("value is not valid utf-8")
+		}
+		return string(value), nil
+	case "base64", "b64":
+		return base64.StdEncoding.EncodeToString(value), nil
+	default:
+		return "", errors.New("unsupported encoding")
+	}
+}
+
+func readKeyQuery(r *http.Request) ([]byte, string, error) {
+	query := r.URL.Query()
+	keyRaw := query.Get("key")
+	if keyRaw == "" {
+		return nil, "", errors.New("missing key")
+	}
+
+	keyEncoding := queryKeyEncoding(query)
+	key, err := decodeBytes(keyRaw, keyEncoding)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return key, keyEncoding, nil
+}
+
+func queryKeyEncoding(query url.Values) string {
+	encoding := strings.ToLower(strings.TrimSpace(query.Get("key_encoding")))
+	if encoding == "" {
+		return "utf-8"
+	}
+	return encoding
+}
+
+func queryValueEncoding(r *http.Request) string {
+	encoding := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("value_encoding")))
+	if encoding == "" {
+		return "base64"
+	}
+	return encoding
+}
+
+func readScanQuery(
+	r *http.Request,
+) (storage.ScanRequest, string, string, bool, error) {
+	query := r.URL.Query()
+	limitRaw := query.Get("limit")
+	if limitRaw == "" {
+		return storage.ScanRequest{}, "", "", false, errors.New("limit is required")
+	}
+
+	limit, err := parseUint32(limitRaw, maxScanEntries)
+	if err != nil {
+		return storage.ScanRequest{}, "", "", false, err
+	}
+
+	stream, err := parseBool(query.Get("stream"))
+	if err != nil {
+		return storage.ScanRequest{}, "", "", false, err
+	}
+
+	includeValues, err := parseBool(query.Get("include_values"))
+	if err != nil {
+		return storage.ScanRequest{}, "", "", false, err
+	}
+
+	keyEncoding := queryEncoding(query, "key_encoding", "base64")
+	valueEncoding := queryEncoding(query, "value_encoding", "base64")
+
+	cursor, err := decodeOptionalKey(query.Get("cursor"), keyEncoding)
+	if err != nil {
+		return storage.ScanRequest{}, "", "", false, err
+	}
+
+	prefix, err := decodeOptionalKey(query.Get("prefix"), keyEncoding)
+	if err != nil {
+		return storage.ScanRequest{}, "", "", false, err
+	}
+
+	maxValueBytes := uint32(0)
+	if includeValues {
+		maxValueBytes, err = parseValueLimit(query.Get("max_value_bytes"))
+		if err != nil {
+			return storage.ScanRequest{}, "", "", false, err
+		}
+	}
+
+	req := storage.ScanRequest{
+		Cursor:        types.Key(cursor),
+		Prefix:        types.Key(prefix),
+		Limit:         limit,
+		IncludeValues: includeValues,
+		MaxValueBytes: maxValueBytes,
+	}
+	return req, keyEncoding, valueEncoding, stream, nil
+}
+
+func decodeOptionalKey(value string, encoding string) ([]byte, error) {
+	if value == "" {
+		return nil, nil
+	}
+	return decodeBytes(value, encoding)
+}
+
+func parseValueLimit(raw string) (uint32, error) {
+	if raw == "" {
+		return maxScanValueBytes, nil
+	}
+	return parseUint32(raw, maxScanValueBytes)
+}
+
+func queryEncoding(query url.Values, key string, fallback string) string {
+	encoding := strings.ToLower(strings.TrimSpace(query.Get(key)))
+	if encoding == "" {
+		return fallback
+	}
+	return encoding
+}
+
+func parseUint32(value string, max uint32) (uint32, error) {
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, errors.New("invalid integer")
+	}
+	if parsed == 0 {
+		return 0, errors.New("value must be greater than zero")
+	}
+	if parsed > uint64(max) {
+		return 0, errors.New("value exceeds limit")
+	}
+	return uint32(parsed), nil
+}
+
+func parseBool(value string) (bool, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return false, nil
+	}
+	if value == "1" || value == "true" {
+		return true, nil
+	}
+	if value == "0" || value == "false" {
+		return false, nil
+	}
+	return false, errors.New("invalid boolean")
+}
+
+func encodeScanEntries(
+	entries []storage.ScanEntry,
+	keyEncoding string,
+	valueEncoding string,
+	includeValues bool,
+) ([]scanEntryResponse, error) {
+	resp := make([]scanEntryResponse, 0, len(entries))
+	for _, entry := range entries {
+		encoded, err := encodeScanEntry(
+			entry,
+			keyEncoding,
+			valueEncoding,
+			includeValues,
+		)
+		if err != nil {
+			return nil, err
+		}
+		resp = append(resp, encoded)
+	}
+	return resp, nil
+}
+
+func encodeScanEntry(
+	entry storage.ScanEntry,
+	keyEncoding string,
+	valueEncoding string,
+	includeValues bool,
+) (scanEntryResponse, error) {
+	encodedKey, err := encodeBytes([]byte(entry.Key), keyEncoding)
+	if err != nil {
+		return scanEntryResponse{}, err
+	}
+	if !includeValues {
+		return scanEntryResponse{Key: encodedKey}, nil
+	}
+
+	encodedValue, err := encodeBytes(entry.Value, valueEncoding)
+	if err != nil {
+		return scanEntryResponse{}, err
+	}
+
+	return scanEntryResponse{
+		Key:   encodedKey,
+		Value: encodedValue,
+	}, nil
+}
+
+func (h *handler) streamScan(
+	w http.ResponseWriter,
+	r *http.Request,
+	req storage.ScanRequest,
+	keyEncoding string,
+	valueEncoding string,
+) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	encoder := json.NewEncoder(w)
+
+	flusher, _ := w.(http.Flusher)
+	cursor := req.Cursor
+	remaining := req.Limit
+
+	for remaining > 0 {
+		if err := r.Context().Err(); err != nil {
+			return
+		}
+
+		pageLimit := remaining
+		if pageLimit > maxScanPageEntries {
+			pageLimit = maxScanPageEntries
+		}
+
+		pageReq := req
+		pageReq.Limit = pageLimit
+		pageReq.Cursor = cursor
+
+		result, err := h.db.Scan(pageReq)
+		if err != nil {
+			writeStreamError(encoder, err)
+			return
+		}
+
+		if len(result.Entries) == 0 {
+			cursor = result.NextCursor
+			break
+		}
+
+		for _, entry := range result.Entries {
+			resp, err := encodeScanEntry(
+				entry,
+				keyEncoding,
+				valueEncoding,
+				req.IncludeValues,
+			)
+			if err != nil {
+				writeStreamError(encoder, err)
+				return
+			}
+			if err := encoder.Encode(resp); err != nil {
+				return
+			}
+		}
+
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		remaining -= uint32(len(result.Entries))
+		if result.NextCursor == "" {
+			cursor = ""
+			break
+		}
+		cursor = result.NextCursor
+	}
+
+	nextCursor, err := encodeBytes([]byte(cursor), keyEncoding)
+	if err != nil {
+		writeStreamError(encoder, err)
+		return
+	}
+
+	info := scanStreamInfo{
+		Type:          "cursor",
+		NextCursor:    nextCursor,
+		KeyEncoding:   keyEncoding,
+		ValueEncoding: valueEncoding,
+	}
+
+	_ = encoder.Encode(info)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func writeStreamError(encoder *json.Encoder, err error) {
+	_ = encoder.Encode(map[string]string{
+		"type":  "error",
+		"error": err.Error(),
+	})
 }
 
 func decodeJSON(r *http.Request, dest any) error {
@@ -293,6 +802,14 @@ func statusForError(err error) int {
 	case errors.Is(err, storage.ErrKeyLocked):
 		return http.StatusConflict
 	case errors.Is(err, storage.ErrReservedValue):
+		return http.StatusConflict
+	case errors.Is(err, storage.ErrInvalidScanLimit),
+		errors.Is(err, storage.ErrInvalidValueLimit),
+		errors.Is(err, storage.ErrInvalidCompactLimit):
+		return http.StatusBadRequest
+	case errors.Is(err, storage.ErrValueTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, storage.ErrCompactLimitExceeded):
 		return http.StatusConflict
 	case errors.Is(err, storage.ErrUnsupported):
 		return http.StatusNotImplemented

@@ -26,6 +26,10 @@ func (c *Client) Delete(key []byte) error {
 	return c.Storage.Delete(types.Key(key))
 }
 
+func (c *Client) Scan(req storage.ScanRequest) (storage.ScanResult, error) {
+	return c.Storage.Scan(req)
+}
+
 func (c *Client) Transaction(fn func(*transaction.Transaction)) (transaction.TransactionStatus, error) {
 	txn := transaction.NewTransaction()
 	fn(txn)
