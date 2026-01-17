@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"hash/fnv"
 	"sync"
 	"time"
@@ -20,6 +19,7 @@ type MemoryStorage struct {
 type PartitionedStorage struct {
 	partitions    []*MemoryStorage
 	numPartitions int
+	vectorStore   *VectorStore
 }
 
 func NewMemoryStorage() *MemoryStorage {
@@ -45,9 +45,13 @@ func (m *MemoryStorage) DeleteVector(id string) error {
 
 // ! The partitioned approach reduces contention by spreading the locks across multiple partitions
 func NewPartitionedStorage(numPartitions int) *PartitionedStorage {
+	if numPartitions <= 0 {
+		numPartitions = 1
+	}
 	ps := &PartitionedStorage{
 		partitions:    make([]*MemoryStorage, numPartitions),
 		numPartitions: numPartitions,
+		vectorStore:   NewVectorStore(),
 	}
 
 	for i := 0; i < numPartitions; i++ {
@@ -58,33 +62,32 @@ func NewPartitionedStorage(numPartitions int) *PartitionedStorage {
 }
 
 func (ps *PartitionedStorage) getPartition(key types.Key) *MemoryStorage {
+	return ps.partitions[ps.getPartitionIndex(key)]
+}
+
+func (ps *PartitionedStorage) getPartitionIndex(key types.Key) int {
 	hash := fnv.New32a()
 	hash.Write([]byte(key))
 	partitionIdx := hash.Sum32() % uint32(ps.numPartitions)
 
-	return ps.partitions[partitionIdx]
+	return int(partitionIdx)
 }
 
 func (ps *PartitionedStorage) ExecuteTransaction(t *transaction.Transaction) error {
 	// Group ops by partition
 	partitionOps := make(map[int][]transaction.Operation)
 	for _, op := range t.Operations {
-		partition := ps.getPartition(op.Key)
-		idx := -1
-		for i, p := range ps.partitions {
-			if p == partition {
-				idx = i
-			}
-		}
-
+		idx := ps.getPartitionIndex(op.Key)
 		partitionOps[idx] = append(partitionOps[idx], op)
 	}
 
 	// Execute transaction on each partition
 	for i, ops := range partitionOps {
-		partitionTxn := &transaction.Transaction{Operations: ops}
+		partitionTxn := transaction.NewTransaction()
+		partitionTxn.Operations = ops
 		err := ps.partitions[i].ExecuteTransaction(partitionTxn)
 		if err != nil {
+			t.Status = transaction.Aborted
 			return err
 		}
 	}
@@ -118,13 +121,25 @@ func (ps *PartitionedStorage) Delete(key types.Key) error {
 	return ps.getPartition(key).Delete(key)
 }
 
+func (ps *PartitionedStorage) AddVector(values []float64, metadata map[string]interface{}) (string, error) {
+	return ps.vectorStore.AddVector(values, metadata)
+}
+
+func (ps *PartitionedStorage) GetVector(id string) (*Vector, error) {
+	return ps.vectorStore.GetVector(id)
+}
+
+func (ps *PartitionedStorage) DeleteVector(id string) error {
+	return ps.vectorStore.DeleteVector(id)
+}
+
 func (m *MemoryStorage) Get(key types.Key) (types.Value, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	entry, ok := m.data[string(key)]
 	if !ok {
-		return nil, errors.New("key not found")
+		return nil, ErrKeyNotFound
 	}
 
 	return entry.Value, nil
@@ -148,7 +163,7 @@ func (m *MemoryStorage) Delete(key types.Key) error {
 	defer m.mu.Unlock()
 
 	if _, ok := m.data[string(key)]; !ok {
-		return errors.New("key not found")
+		return ErrKeyNotFound
 	}
 
 	delete(m.data, string(key))
@@ -165,7 +180,7 @@ func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
 		// Check if key is locked by another op
 		if _, ok := m.locks[string(op.Key)]; ok {
 			t.Status = transaction.Aborted
-			return errors.New("key is locked")
+			return ErrKeyLocked
 		}
 		m.locks[string(op.Key)] = struct{}{}
 	}
@@ -191,5 +206,18 @@ func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
 		delete(m.locks, string(op.Key))
 	}
 
+	return nil
+}
+
+func (m *MemoryStorage) Close() error {
+	return nil
+}
+
+func (ps *PartitionedStorage) Close() error {
+	for _, partition := range ps.partitions {
+		if err := partition.Close(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
