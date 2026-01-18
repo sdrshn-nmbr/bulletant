@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/sdrshn-nmbr/bulletant/internal/billing"
 	"github.com/sdrshn-nmbr/bulletant/internal/db"
 	wal "github.com/sdrshn-nmbr/bulletant/internal/log"
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
@@ -42,7 +43,8 @@ type LocalOptions struct {
 }
 
 type LocalClient struct {
-	db *db.DB
+	db      *db.DB
+	billing *billing.Service
 }
 
 func OpenLocal(opts LocalOptions) (*LocalClient, error) {
@@ -79,7 +81,10 @@ func OpenLocal(opts LocalOptions) (*LocalClient, error) {
 		return nil, err
 	}
 
-	return &LocalClient{db: database}, nil
+	return &LocalClient{
+		db:      database,
+		billing: billing.NewService(database, billing.ServiceOptions{}),
+	}, nil
 }
 
 func (c *LocalClient) Get(ctx context.Context, key []byte) ([]byte, error) {

@@ -33,6 +33,18 @@ func dispatchCommand(state *cliState, args []string) error {
 		return runSnapshot(state, args[1:])
 	case "backup":
 		return runBackup(state, args[1:])
+	case "billing-account":
+		return runBillingAccount(state, args[1:])
+	case "billing-credit":
+		return runBillingCredit(state, args[1:])
+	case "billing-usage":
+		return runBillingUsage(state, args[1:])
+	case "billing-balance":
+		return runBillingBalance(state, args[1:])
+	case "billing-export":
+		return runBillingExport(state, args[1:])
+	case "billing-import":
+		return runBillingImport(state, args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -43,5 +55,5 @@ func dispatchCommand(state *cliState, args []string) error {
 
 func printUsage() {
 	fmt.Println("usage: bulletant [global flags] <command> [command flags]")
-	fmt.Println("commands: get, put, delete, scan, txn, vector-add, vector-get, vector-delete, compact, snapshot, backup")
+	fmt.Println("commands: get, put, delete, scan, txn, vector-add, vector-get, vector-delete, compact, snapshot, backup, billing-account, billing-credit, billing-usage, billing-balance, billing-export, billing-import")
 }

@@ -745,12 +745,29 @@ func (c *HTTPClient) mapHTTPError(status int, message string) error {
 	case http.StatusBadRequest:
 		return ErrInvalidArgument
 	case http.StatusNotFound:
-		if strings.Contains(strings.ToLower(message), "vector") {
+		lower := strings.ToLower(message)
+		if strings.Contains(lower, "account") {
+			return ErrAccountNotFound
+		}
+		if strings.Contains(lower, "price plan") {
+			return ErrPricePlanNotFound
+		}
+		if strings.Contains(lower, "vector") {
 			return ErrVectorNotFound
 		}
 		return ErrKeyNotFound
 	case http.StatusConflict:
-		return ErrConflict
+		lower := strings.ToLower(message)
+		switch {
+		case strings.Contains(lower, "account already exists"):
+			return ErrAccountExists
+		case strings.Contains(lower, "insufficient credits"):
+			return ErrInsufficientCredits
+		case strings.Contains(lower, "duplicate event"):
+			return ErrDuplicateEvent
+		default:
+			return ErrConflict
+		}
 	case http.StatusNotImplemented:
 		return ErrUnsupported
 	default:

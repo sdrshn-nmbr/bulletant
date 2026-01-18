@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/sdrshn-nmbr/bulletant/internal/billing"
 	"github.com/sdrshn-nmbr/bulletant/internal/db"
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
@@ -26,7 +29,8 @@ const (
 )
 
 type handler struct {
-	db *db.DB
+	db      *db.DB
+	billing *billing.Service
 }
 
 type kvRequest struct {
@@ -132,8 +136,39 @@ type backupResponse struct {
 	DurationMs   int64            `json:"duration_ms"`
 }
 
+type billingAccountRequest struct {
+	Tenant   string                 `json:"tenant"`
+	ID       string                 `json:"id"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+type billingCreditRequest struct {
+	Tenant    string `json:"tenant"`
+	AccountID string `json:"account_id"`
+	Amount    int64  `json:"amount"`
+}
+
+type billingUsageListResponse struct {
+	Events     []billing.UsageEvent `json:"events"`
+	NextCursor string               `json:"next_cursor,omitempty"`
+}
+
+type billingExportRequest struct {
+	Tenant string `json:"tenant"`
+	Cursor string `json:"cursor,omitempty"`
+	Limit  uint32 `json:"limit"`
+}
+
+type billingExportCursor struct {
+	Type       string `json:"type"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
 func NewHandler(db *db.DB) http.Handler {
-	h := &handler{db: db}
+	h := &handler{
+		db:      db,
+		billing: billing.NewService(db, billing.ServiceOptions{}),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.handleRoot)
 	mux.HandleFunc("/healthz", h.handleHealth)
@@ -143,6 +178,12 @@ func NewHandler(db *db.DB) http.Handler {
 	mux.HandleFunc("/txn", h.handleTxn)
 	mux.HandleFunc("/vectors", h.handleVectors)
 	mux.HandleFunc("/vectors/", h.handleVectorByID)
+	mux.HandleFunc("/billing/accounts", h.handleBillingAccounts)
+	mux.HandleFunc("/billing/accounts/", h.handleBillingAccountByID)
+	mux.HandleFunc("/billing/credits", h.handleBillingCredits)
+	mux.HandleFunc("/billing/usage", h.handleBillingUsage)
+	mux.HandleFunc("/billing/sync/export", h.handleBillingExport)
+	mux.HandleFunc("/billing/sync/import", h.handleBillingImport)
 	mux.HandleFunc("/maintenance/compact", h.handleCompact)
 	mux.HandleFunc("/maintenance/snapshot", h.handleSnapshot)
 	mux.HandleFunc("/maintenance/backup", h.handleBackup)
@@ -565,6 +606,269 @@ func (h *handler) handleVectorByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *handler) handleBillingAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req billingAccountRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Tenant) == "" || strings.TrimSpace(req.ID) == "" {
+		writeError(w, http.StatusBadRequest, "tenant and id are required")
+		return
+	}
+
+	account, err := h.billing.CreateAccount(r.Context(), billing.Account{
+		Tenant:   req.Tenant,
+		ID:       req.ID,
+		Metadata: req.Metadata,
+	})
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, account)
+}
+
+func (h *handler) handleBillingAccountByID(w http.ResponseWriter, r *http.Request) {
+	raw, err := keyFromPath("/billing/accounts/", r.URL.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tenant := strings.TrimSpace(r.URL.Query().Get("tenant"))
+	if tenant == "" {
+		writeError(w, http.StatusBadRequest, "tenant is required")
+		return
+	}
+
+	if strings.HasSuffix(raw, "/balance") {
+		accountID := strings.TrimSuffix(raw, "/balance")
+		if strings.TrimSpace(accountID) == "" {
+			writeError(w, http.StatusBadRequest, "account_id is required")
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		balance, err := h.billing.GetBalance(r.Context(), tenant, accountID)
+		if err != nil {
+			writeError(w, statusForError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, balance)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	account, err := h.billing.GetAccount(r.Context(), tenant, raw)
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, account)
+}
+
+func (h *handler) handleBillingCredits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req billingCreditRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Tenant) == "" || strings.TrimSpace(req.AccountID) == "" || req.Amount <= 0 {
+		writeError(w, http.StatusBadRequest, "tenant, account_id, and amount are required")
+		return
+	}
+
+	balance, err := h.billing.CreditAccount(r.Context(), req.Tenant, req.AccountID, req.Amount)
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, balance)
+}
+
+func (h *handler) handleBillingUsage(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		var event billing.UsageEvent
+		if err := decodeJSON(r, &event); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if strings.TrimSpace(event.ID) == "" ||
+			strings.TrimSpace(event.Tenant) == "" ||
+			strings.TrimSpace(event.AccountID) == "" ||
+			event.Units <= 0 {
+			writeError(w, http.StatusBadRequest, "id, tenant, account_id, and units are required")
+			return
+		}
+		if event.UnitPrice <= 0 && strings.TrimSpace(event.PricePlanID) == "" {
+			writeError(w, http.StatusBadRequest, "unit_price or price_plan_id is required")
+			return
+		}
+		entry, err := h.billing.RecordUsage(r.Context(), event)
+		if err != nil {
+			writeError(w, statusForError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, entry)
+	case http.MethodGet:
+		query := r.URL.Query()
+		tenant := strings.TrimSpace(query.Get("tenant"))
+		accountID := strings.TrimSpace(query.Get("account_id"))
+		if tenant == "" || accountID == "" {
+			writeError(w, http.StatusBadRequest, "tenant and account_id are required")
+			return
+		}
+		limitRaw := query.Get("limit")
+		if limitRaw == "" {
+			writeError(w, http.StatusBadRequest, "limit is required")
+			return
+		}
+		limit, err := parseUint32(limitRaw, maxScanEntries)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		cursor := query.Get("cursor")
+
+		events, nextCursor, err := h.billing.ListUsageEvents(
+			r.Context(),
+			tenant,
+			accountID,
+			cursor,
+			limit,
+		)
+		if err != nil {
+			writeError(w, statusForError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, billingUsageListResponse{
+			Events:     events,
+			NextCursor: nextCursor,
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *handler) handleBillingExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req billingExportRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Limit == 0 {
+		writeError(w, http.StatusBadRequest, "limit is required")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	encoder := json.NewEncoder(w)
+	flusher, _ := w.(http.Flusher)
+
+	nextCursor, err := h.billing.ExportEvents(
+		r.Context(),
+		req.Tenant,
+		req.Cursor,
+		req.Limit,
+		func(event billing.UsageEvent) error {
+			if err := encoder.Encode(event); err != nil {
+				return err
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		writeStreamError(encoder, err)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
+
+	_ = encoder.Encode(billingExportCursor{
+		Type:       "cursor",
+		NextCursor: nextCursor,
+	})
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func (h *handler) handleBillingImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	reader := bufio.NewReader(io.LimitReader(r.Body, maxBodyBytes))
+	first, err := firstNonSpaceByte(reader)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+
+	var events []billing.UsageEvent
+	if first == '[' {
+		decoder := json.NewDecoder(reader)
+		if err := decoder.Decode(&events); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 0, 64*1024), maxBodyBytes)
+		for scanner.Scan() {
+			line := bytes.TrimSpace(scanner.Bytes())
+			if len(line) == 0 {
+				continue
+			}
+			var event billing.UsageEvent
+			if err := json.Unmarshal(line, &event); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			events = append(events, event)
+		}
+		if err := scanner.Err(); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	stats, err := h.billing.ImportEvents(r.Context(), events)
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func readValue(r *http.Request) ([]byte, error) {
 	contentType := r.Header.Get("Content-Type")
 	if strings.Contains(contentType, "application/json") {
@@ -905,11 +1209,17 @@ func writeError(w http.ResponseWriter, status int, message string) {
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, storage.ErrKeyNotFound),
-		errors.Is(err, storage.ErrVectorNotFound):
+		errors.Is(err, storage.ErrVectorNotFound),
+		errors.Is(err, billing.ErrAccountNotFound),
+		errors.Is(err, billing.ErrPricePlanNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, storage.ErrKeyLocked):
 		return http.StatusConflict
 	case errors.Is(err, storage.ErrReservedValue):
+		return http.StatusConflict
+	case errors.Is(err, billing.ErrAccountExists),
+		errors.Is(err, billing.ErrInsufficientCredits),
+		errors.Is(err, billing.ErrDuplicateEvent):
 		return http.StatusConflict
 	case errors.Is(err, storage.ErrInvalidScanLimit),
 		errors.Is(err, storage.ErrInvalidValueLimit),
@@ -952,4 +1262,28 @@ func keyFromPath(prefix string, path string) (string, error) {
 		return "", err
 	}
 	return decoded, nil
+}
+
+func firstNonSpaceByte(reader *bufio.Reader) (byte, error) {
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		if !isSpaceByte(b) {
+			if err := reader.UnreadByte(); err != nil {
+				return 0, err
+			}
+			return b, nil
+		}
+	}
+}
+
+func isSpaceByte(value byte) bool {
+	switch value {
+	case ' ', '\n', '\r', '\t':
+		return true
+	default:
+		return false
+	}
 }
