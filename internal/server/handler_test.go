@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -162,5 +164,64 @@ func TestScanHandler(t *testing.T) {
 	}
 	if scan.Entries[0].Key != "alpha" {
 		t.Fatalf("Expected alpha, got %s", scan.Entries[0].Key)
+	}
+}
+
+func TestSnapshotHandler(t *testing.T) {
+	store := storage.NewMemoryStorage()
+	database, err := db.Open(db.Options{Storage: store})
+	if err != nil {
+		t.Fatalf("DB open failed: %v", err)
+	}
+	defer database.Close()
+
+	if err := database.Put([]byte("alpha"), []byte("one")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	handler := NewHandler(database)
+	snapshotPath := filepath.Join(t.TempDir(), "snapshot.bin")
+	body := `{"path":"` + snapshotPath + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/maintenance/snapshot", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", resp.Code)
+	}
+
+	if _, err := os.Stat(snapshotPath); err != nil {
+		t.Fatalf("Snapshot not created: %v", err)
+	}
+}
+
+func TestBackupHandler(t *testing.T) {
+	store := storage.NewMemoryStorage()
+	database, err := db.Open(db.Options{Storage: store})
+	if err != nil {
+		t.Fatalf("DB open failed: %v", err)
+	}
+	defer database.Close()
+
+	if err := database.Put([]byte("alpha"), []byte("one")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	handler := NewHandler(database)
+	backupDir := t.TempDir()
+	body := `{"directory":"` + backupDir + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/maintenance/backup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", resp.Code)
+	}
+
+	if _, err := os.Stat(filepath.Join(backupDir, "manifest.json")); err != nil {
+		t.Fatalf("Backup manifest not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(backupDir, "storage.snapshot")); err != nil {
+		t.Fatalf("Backup snapshot not created: %v", err)
 	}
 }

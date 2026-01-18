@@ -1,5 +1,7 @@
 package client
 
+import "time"
+
 type OperationType string
 
 const (
@@ -43,4 +45,29 @@ type Vector struct {
 	ID       string
 	Values   []float64
 	Metadata map[string]interface{}
+}
+
+type SnapshotOptions struct {
+	Path       string
+	IncludeWAL bool
+}
+
+type SnapshotStats struct {
+	Entries  uint32
+	Bytes    uint64
+	Path     string
+	WALPath  string
+	WALBytes uint64
+	Duration time.Duration
+}
+
+type BackupOptions struct {
+	Directory  string
+	IncludeWAL bool
+}
+
+type BackupStats struct {
+	Snapshot     SnapshotStats
+	ManifestPath string
+	Duration     time.Duration
 }

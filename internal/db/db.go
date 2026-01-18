@@ -1,22 +1,27 @@
 package db
 
 import (
+	"context"
 	"errors"
 
 	wal "github.com/sdrshn-nmbr/bulletant/internal/log"
+	"github.com/sdrshn-nmbr/bulletant/internal/maintenance"
 	"github.com/sdrshn-nmbr/bulletant/internal/storage"
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
 	"github.com/sdrshn-nmbr/bulletant/internal/types"
 )
 
 type Options struct {
-	Storage storage.Storage
-	WAL     *wal.WAL
+	Storage    storage.Storage
+	WAL        *wal.WAL
+	Compaction CompactionOptions
 }
 
 type DB struct {
-	storage storage.Storage
-	wal     *wal.WAL
+	storage             storage.Storage
+	wal                 *wal.WAL
+	compactionScheduler *maintenance.CompactionScheduler
+	compactionCancel    context.CancelFunc
 }
 
 func Open(opts Options) (*DB, error) {
@@ -30,10 +35,23 @@ func Open(opts Options) (*DB, error) {
 		}
 	}
 
-	return &DB{
+	database := &DB{
 		storage: opts.Storage,
 		wal:     opts.WAL,
-	}, nil
+	}
+
+	scheduler, cancel, err := startCompactionScheduler(opts.Storage, opts.Compaction)
+	if err != nil {
+		if opts.WAL != nil {
+			_ = opts.WAL.Close()
+		}
+		_ = opts.Storage.Close()
+		return nil, err
+	}
+	database.compactionScheduler = scheduler
+	database.compactionCancel = cancel
+
+	return database, nil
 }
 
 func (d *DB) Get(key []byte) ([]byte, error) {
@@ -108,11 +126,20 @@ func (d *DB) Compact(opts storage.CompactOptions) (storage.CompactStats, error) 
 	if !ok {
 		return storage.CompactStats{}, storage.ErrUnsupported
 	}
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
 	return compacter.Compact(opts)
 }
 
 func (d *DB) Close() error {
 	var errs []error
+	if d.compactionCancel != nil {
+		d.compactionCancel()
+	}
+	if d.compactionScheduler != nil {
+		d.compactionScheduler.Stop()
+	}
 	if d.wal != nil {
 		if err := d.wal.Close(); err != nil {
 			errs = append(errs, errors.Join(ErrWALCloseFail, err))

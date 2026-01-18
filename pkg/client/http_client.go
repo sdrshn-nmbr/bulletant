@@ -16,32 +16,32 @@ import (
 )
 
 type HTTPOptions struct {
-	BaseURL         string
-	HTTPClient      *http.Client
-	RetryPolicy     RetryPolicy
-	KeyEncoding     string
-	ValueEncoding   string
-	UserAgent       string
+	BaseURL          string
+	HTTPClient       *http.Client
+	RetryPolicy      RetryPolicy
+	KeyEncoding      string
+	ValueEncoding    string
+	UserAgent        string
 	MaxResponseBytes uint64
 }
 
 type RequestOptions struct {
-	DisableRetry bool
-	KeyEncoding  string
+	DisableRetry  bool
+	KeyEncoding   string
 	ValueEncoding string
 }
 
 type HTTPClient struct {
-	baseURL         *url.URL
-	httpClient      *http.Client
-	retryPolicy     RetryPolicy
-	retryStatus     map[int]struct{}
-	keyEncoding     string
-	valueEncoding   string
-	userAgent       string
+	baseURL          *url.URL
+	httpClient       *http.Client
+	retryPolicy      RetryPolicy
+	retryStatus      map[int]struct{}
+	keyEncoding      string
+	valueEncoding    string
+	userAgent        string
 	maxResponseBytes uint64
-	rngMu           sync.Mutex
-	rng             *rand.Rand
+	rngMu            sync.Mutex
+	rng              *rand.Rand
 }
 
 type HTTPError struct {
@@ -84,15 +84,15 @@ func NewHTTPClient(opts HTTPOptions) (*HTTPClient, error) {
 	}
 
 	return &HTTPClient{
-		baseURL:         parsed,
-		httpClient:      opts.HTTPClient,
-		retryPolicy:     opts.RetryPolicy,
-		retryStatus:     retryStatus,
-		keyEncoding:     opts.KeyEncoding,
-		valueEncoding:   opts.ValueEncoding,
-		userAgent:       opts.UserAgent,
+		baseURL:          parsed,
+		httpClient:       opts.HTTPClient,
+		retryPolicy:      opts.RetryPolicy,
+		retryStatus:      retryStatus,
+		keyEncoding:      opts.KeyEncoding,
+		valueEncoding:    opts.ValueEncoding,
+		userAgent:        opts.UserAgent,
 		maxResponseBytes: opts.MaxResponseBytes,
-		rng:             rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:              rand.New(rand.NewSource(time.Now().UnixNano())),
 	}, nil
 }
 
@@ -437,6 +437,84 @@ func (c *HTTPClient) Compact(
 	return stats, nil
 }
 
+func (c *HTTPClient) Snapshot(
+	ctx context.Context,
+	opts SnapshotOptions,
+	reqOpts RequestOptions,
+) (SnapshotStats, error) {
+	if err := ctx.Err(); err != nil {
+		return SnapshotStats{}, err
+	}
+	if opts.Path == "" {
+		return SnapshotStats{}, ErrInvalidArgument
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"path":        opts.Path,
+		"include_wal": opts.IncludeWAL,
+	})
+	if err != nil {
+		return SnapshotStats{}, err
+	}
+
+	requestURL := c.buildURL("/maintenance/snapshot", nil)
+	var stats SnapshotStats
+
+	err = c.doRequest(ctx, requestSpec{
+		method: http.MethodPost,
+		url:    requestURL,
+		body:   payload,
+		headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+	}, reqOpts, func(resp *http.Response) error {
+		return c.decodeSnapshot(resp, &stats)
+	})
+	if err != nil {
+		return SnapshotStats{}, err
+	}
+	return stats, nil
+}
+
+func (c *HTTPClient) Backup(
+	ctx context.Context,
+	opts BackupOptions,
+	reqOpts RequestOptions,
+) (BackupStats, error) {
+	if err := ctx.Err(); err != nil {
+		return BackupStats{}, err
+	}
+	if opts.Directory == "" {
+		return BackupStats{}, ErrInvalidArgument
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"directory":   opts.Directory,
+		"include_wal": opts.IncludeWAL,
+	})
+	if err != nil {
+		return BackupStats{}, err
+	}
+
+	requestURL := c.buildURL("/maintenance/backup", nil)
+	var stats BackupStats
+
+	err = c.doRequest(ctx, requestSpec{
+		method: http.MethodPost,
+		url:    requestURL,
+		body:   payload,
+		headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+	}, reqOpts, func(resp *http.Response) error {
+		return c.decodeBackup(resp, &stats)
+	})
+	if err != nil {
+		return BackupStats{}, err
+	}
+	return stats, nil
+}
+
 type requestSpec struct {
 	method  string
 	url     string
@@ -664,6 +742,8 @@ func joinURLPath(basePath string, suffix string) string {
 
 func (c *HTTPClient) mapHTTPError(status int, message string) error {
 	switch status {
+	case http.StatusBadRequest:
+		return ErrInvalidArgument
 	case http.StatusNotFound:
 		if strings.Contains(strings.ToLower(message), "vector") {
 			return ErrVectorNotFound
@@ -1042,5 +1122,65 @@ func (c *HTTPClient) decodeCompact(resp *http.Response, stats *CompactStats) err
 	if err := json.Unmarshal(body, stats); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (c *HTTPClient) decodeSnapshot(resp *http.Response, stats *SnapshotStats) error {
+	body, err := c.readResponseBody(resp)
+	if err != nil {
+		return err
+	}
+
+	var payload struct {
+		Entries    uint32 `json:"entries"`
+		Bytes      uint64 `json:"bytes"`
+		Path       string `json:"path"`
+		WALPath    string `json:"wal_path,omitempty"`
+		WALBytes   uint64 `json:"wal_bytes,omitempty"`
+		DurationMs int64  `json:"duration_ms"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
+	}
+	stats.Entries = payload.Entries
+	stats.Bytes = payload.Bytes
+	stats.Path = payload.Path
+	stats.WALPath = payload.WALPath
+	stats.WALBytes = payload.WALBytes
+	stats.Duration = time.Duration(payload.DurationMs) * time.Millisecond
+	return nil
+}
+
+func (c *HTTPClient) decodeBackup(resp *http.Response, stats *BackupStats) error {
+	body, err := c.readResponseBody(resp)
+	if err != nil {
+		return err
+	}
+
+	var payload struct {
+		Snapshot struct {
+			Entries    uint32 `json:"entries"`
+			Bytes      uint64 `json:"bytes"`
+			Path       string `json:"path"`
+			WALPath    string `json:"wal_path,omitempty"`
+			WALBytes   uint64 `json:"wal_bytes,omitempty"`
+			DurationMs int64  `json:"duration_ms"`
+		} `json:"snapshot"`
+		ManifestPath string `json:"manifest_path"`
+		DurationMs   int64  `json:"duration_ms"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
+	}
+	stats.Snapshot = SnapshotStats{
+		Entries:  payload.Snapshot.Entries,
+		Bytes:    payload.Snapshot.Bytes,
+		Path:     payload.Snapshot.Path,
+		WALPath:  payload.Snapshot.WALPath,
+		WALBytes: payload.Snapshot.WALBytes,
+		Duration: time.Duration(payload.Snapshot.DurationMs) * time.Millisecond,
+	}
+	stats.ManifestPath = payload.ManifestPath
+	stats.Duration = time.Duration(payload.DurationMs) * time.Millisecond
 	return nil
 }

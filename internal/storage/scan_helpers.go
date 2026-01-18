@@ -42,4 +42,3 @@ func entriesToKeys(entries []ScanEntry) []string {
 	}
 	return keys
 }
-

@@ -2,11 +2,13 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/sdrshn-nmbr/bulletant/internal/transaction"
@@ -238,6 +240,9 @@ func (d *DiskStorage) Compact(opts CompactOptions) (CompactStats, error) {
 		BytesBefore: uint64(d.size),
 	}
 
+	if err := checkCompactContext(opts.Context); err != nil {
+		return stats, err
+	}
 	if err := d.validateCompactOptions(&opts); err != nil {
 		return stats, err
 	}
@@ -277,6 +282,7 @@ func (d *DiskStorage) Compact(opts CompactOptions) (CompactStats, error) {
 		tempPath,
 		keys,
 		newIndex,
+		opts.Context,
 	)
 	if err != nil {
 		return stats, err
@@ -291,6 +297,37 @@ func (d *DiskStorage) Compact(opts CompactOptions) (CompactStats, error) {
 	cleanupTemp = false
 
 	return stats, nil
+}
+
+func (d *DiskStorage) Snapshot(opts SnapshotOptions) (SnapshotStats, error) {
+	if strings.TrimSpace(opts.Path) == "" {
+		return SnapshotStats{}, ErrInvalidPath
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if err := d.file.Sync(); err != nil {
+		return SnapshotStats{}, err
+	}
+
+	srcPath := d.file.Name()
+	tempPath := opts.TempPath
+	if tempPath == "" {
+		tempPath = opts.Path + ".tmp"
+	}
+
+	bytesWritten, err := copyFileAtomic(srcPath, tempPath, opts.Path)
+	if err != nil {
+		return SnapshotStats{}, err
+	}
+
+	keys := d.scanKeys(types.Key(""))
+	return SnapshotStats{
+		Entries: uint32(len(keys)),
+		Bytes:   bytesWritten,
+		Path:    opts.Path,
+	}, nil
 }
 
 func (d *DiskStorage) putLocked(key types.Key, value types.Value) error {
@@ -616,6 +653,7 @@ func (d *DiskStorage) writeCompactFile(
 	path string,
 	keys []string,
 	newIndex map[string]diskIndexEntry,
+	ctx context.Context,
 ) (uint32, uint64, error) {
 	tempFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
@@ -630,6 +668,9 @@ func (d *DiskStorage) writeCompactFile(
 	offset := int64(diskHeaderSize)
 	var entriesWritten uint32
 	for _, key := range keys {
+		if err := checkCompactContext(ctx); err != nil {
+			return 0, 0, err
+		}
 		entry := d.index[key]
 		value, err := d.readValue(entry, ScanRequest{
 			Limit:         1,
@@ -798,3 +839,9 @@ func uint32ToBytes(u uint32) []byte {
 	return b
 }
 
+func checkCompactContext(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
