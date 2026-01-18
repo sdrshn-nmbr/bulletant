@@ -162,6 +162,41 @@ func (w *WAL) Close() error {
 	return w.file.Close()
 }
 
+func (w *WAL) CopyTo(path string) (uint64, error) {
+	if path == "" {
+		return 0, storage.ErrInvalidPath
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.file.Sync(); err != nil {
+		return 0, err
+	}
+
+	if _, err := w.file.Seek(0, 0); err != nil {
+		return 0, err
+	}
+
+	dest, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0666)
+	if err != nil {
+		return 0, err
+	}
+	defer dest.Close()
+
+	written, err := io.Copy(dest, w.file)
+	if err != nil {
+		return 0, err
+	}
+	if err := dest.Sync(); err != nil {
+		return 0, err
+	}
+
+	_, _ = w.file.Seek(0, io.SeekEnd)
+
+	return uint64(written), nil
+}
+
 func (w *WAL) logStatus(rt recordType, id uuid.UUID) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

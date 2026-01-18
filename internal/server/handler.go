@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -34,16 +35,16 @@ type kvRequest struct {
 }
 
 type kvEnvelope struct {
-	Key          string `json:"key"`
-	Value        string `json:"value,omitempty"`
-	KeyEncoding  string `json:"key_encoding,omitempty"`
+	Key           string `json:"key"`
+	Value         string `json:"value,omitempty"`
+	KeyEncoding   string `json:"key_encoding,omitempty"`
 	ValueEncoding string `json:"value_encoding,omitempty"`
 }
 
 type kvResponse struct {
-	Key      string `json:"key"`
-	Value    string `json:"value"`
-	Encoding string `json:"encoding"`
+	Key         string `json:"key"`
+	Value       string `json:"value"`
+	Encoding    string `json:"encoding"`
 	KeyEncoding string `json:"key_encoding,omitempty"`
 }
 
@@ -52,11 +53,11 @@ type txnRequest struct {
 }
 
 type txnOperation struct {
-	Type     string `json:"type"`
-	Key      string `json:"key"`
+	Type        string `json:"type"`
+	Key         string `json:"key"`
 	KeyEncoding string `json:"key_encoding,omitempty"`
-	Value    string `json:"value,omitempty"`
-	Encoding string `json:"encoding,omitempty"`
+	Value       string `json:"value,omitempty"`
+	Encoding    string `json:"encoding,omitempty"`
 }
 
 type txnResponse struct {
@@ -106,6 +107,31 @@ type compactResponse struct {
 	BytesAfter     uint64 `json:"bytes_after"`
 }
 
+type snapshotRequest struct {
+	Path       string `json:"path"`
+	IncludeWAL bool   `json:"include_wal,omitempty"`
+}
+
+type snapshotResponse struct {
+	Entries    uint32 `json:"entries"`
+	Bytes      uint64 `json:"bytes"`
+	Path       string `json:"path"`
+	WALPath    string `json:"wal_path,omitempty"`
+	WALBytes   uint64 `json:"wal_bytes,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+type backupRequest struct {
+	Directory  string `json:"directory"`
+	IncludeWAL bool   `json:"include_wal,omitempty"`
+}
+
+type backupResponse struct {
+	Snapshot     snapshotResponse `json:"snapshot"`
+	ManifestPath string           `json:"manifest_path"`
+	DurationMs   int64            `json:"duration_ms"`
+}
+
 func NewHandler(db *db.DB) http.Handler {
 	h := &handler{db: db}
 	mux := http.NewServeMux()
@@ -118,6 +144,8 @@ func NewHandler(db *db.DB) http.Handler {
 	mux.HandleFunc("/vectors", h.handleVectors)
 	mux.HandleFunc("/vectors/", h.handleVectorByID)
 	mux.HandleFunc("/maintenance/compact", h.handleCompact)
+	mux.HandleFunc("/maintenance/snapshot", h.handleSnapshot)
+	mux.HandleFunc("/maintenance/backup", h.handleBackup)
 	return mux
 }
 
@@ -156,9 +184,9 @@ func (h *handler) handleKV(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, kvResponse{
-			Key:      key,
-			Value:    base64.StdEncoding.EncodeToString(value),
-			Encoding: "base64",
+			Key:         key,
+			Value:       base64.StdEncoding.EncodeToString(value),
+			Encoding:    "base64",
 			KeyEncoding: "utf-8",
 		})
 	case http.MethodPut, http.MethodPost:
@@ -386,6 +414,7 @@ func (h *handler) handleCompact(w http.ResponseWriter, r *http.Request) {
 		MaxEntries: req.MaxEntries,
 		MaxBytes:   req.MaxBytes,
 		TempPath:   req.TempPath,
+		Context:    r.Context(),
 	})
 	if err != nil {
 		writeError(w, statusForError(err), err.Error())
@@ -397,6 +426,85 @@ func (h *handler) handleCompact(w http.ResponseWriter, r *http.Request) {
 		EntriesWritten: stats.EntriesWritten,
 		BytesBefore:    stats.BytesBefore,
 		BytesAfter:     stats.BytesAfter,
+	})
+}
+
+func (h *handler) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req snapshotRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePathInput(req.Path); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	stats, err := h.db.Snapshot(db.SnapshotOptions{
+		Path:       req.Path,
+		IncludeWAL: req.IncludeWAL,
+	})
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, snapshotResponse{
+		Entries:    stats.Entries,
+		Bytes:      stats.Bytes,
+		Path:       stats.Path,
+		WALPath:    stats.WALPath,
+		WALBytes:   stats.WALBytes,
+		DurationMs: stats.Duration.Milliseconds(),
+	})
+}
+
+func (h *handler) handleBackup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req backupRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePathInput(req.Directory); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	info, err := os.Stat(req.Directory)
+	if err != nil || !info.IsDir() {
+		writeError(w, http.StatusBadRequest, "directory does not exist")
+		return
+	}
+
+	stats, err := h.db.Backup(db.BackupOptions{
+		Directory:  req.Directory,
+		IncludeWAL: req.IncludeWAL,
+	})
+	if err != nil {
+		writeError(w, statusForError(err), err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, backupResponse{
+		Snapshot: snapshotResponse{
+			Entries:    stats.Snapshot.Entries,
+			Bytes:      stats.Snapshot.Bytes,
+			Path:       stats.Snapshot.Path,
+			WALPath:    stats.Snapshot.WALPath,
+			WALBytes:   stats.Snapshot.WALBytes,
+			DurationMs: stats.Snapshot.Duration.Milliseconds(),
+		},
+		ManifestPath: stats.ManifestPath,
+		DurationMs:   stats.Duration.Milliseconds(),
 	})
 }
 
@@ -805,17 +913,30 @@ func statusForError(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, storage.ErrInvalidScanLimit),
 		errors.Is(err, storage.ErrInvalidValueLimit),
-		errors.Is(err, storage.ErrInvalidCompactLimit):
+		errors.Is(err, storage.ErrInvalidCompactLimit),
+		errors.Is(err, storage.ErrInvalidPath),
+		errors.Is(err, storage.ErrInvalidBloomParams):
 		return http.StatusBadRequest
 	case errors.Is(err, storage.ErrValueTooLarge):
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, storage.ErrCompactLimitExceeded):
 		return http.StatusConflict
-	case errors.Is(err, storage.ErrUnsupported):
+	case errors.Is(err, storage.ErrUnsupported),
+		errors.Is(err, storage.ErrSnapshotUnsupported):
 		return http.StatusNotImplemented
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+func validatePathInput(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return storage.ErrInvalidPath
+	}
+	if strings.Contains(path, "..") {
+		return storage.ErrInvalidPath
+	}
+	return nil
 }
 
 func keyFromPath(prefix string, path string) (string, error) {

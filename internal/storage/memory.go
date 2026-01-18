@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"encoding/binary"
 	"hash/fnv"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +25,11 @@ type PartitionedStorage struct {
 	numPartitions int
 	vectorStore   *VectorStore
 }
+
+const (
+	memorySnapshotMagic   = "BMSN"
+	memorySnapshotVersion = uint8(1)
+)
 
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
@@ -244,6 +252,48 @@ func (m *MemoryStorage) ExecuteTransaction(t *transaction.Transaction) error {
 	return nil
 }
 
+func (m *MemoryStorage) Snapshot(opts SnapshotOptions) (SnapshotStats, error) {
+	if strings.TrimSpace(opts.Path) == "" {
+		return SnapshotStats{}, ErrInvalidPath
+	}
+
+	m.mu.RLock()
+	entries := make([]types.Entry, 0, len(m.data))
+	for _, entry := range m.data {
+		valueCopy := append([]byte(nil), entry.Value...)
+		entries = append(entries, types.Entry{
+			Key:       entry.Key,
+			Value:     valueCopy,
+			Timestamp: entry.Timestamp,
+		})
+	}
+	m.mu.RUnlock()
+
+	return writeMemorySnapshot(opts, entries)
+}
+
+func (ps *PartitionedStorage) Snapshot(opts SnapshotOptions) (SnapshotStats, error) {
+	if strings.TrimSpace(opts.Path) == "" {
+		return SnapshotStats{}, ErrInvalidPath
+	}
+
+	entries := make([]types.Entry, 0)
+	for _, partition := range ps.partitions {
+		partition.mu.RLock()
+		for _, entry := range partition.data {
+			valueCopy := append([]byte(nil), entry.Value...)
+			entries = append(entries, types.Entry{
+				Key:       entry.Key,
+				Value:     valueCopy,
+				Timestamp: entry.Timestamp,
+			})
+		}
+		partition.mu.RUnlock()
+	}
+
+	return writeMemorySnapshot(opts, entries)
+}
+
 func (m *MemoryStorage) Close() error {
 	return nil
 }
@@ -288,4 +338,85 @@ func collectScanEntries(
 	}
 
 	return entries, nil
+}
+
+func writeMemorySnapshot(opts SnapshotOptions, entries []types.Entry) (SnapshotStats, error) {
+	if strings.TrimSpace(opts.Path) == "" {
+		return SnapshotStats{}, ErrInvalidPath
+	}
+	tempPath := opts.TempPath
+	if tempPath == "" {
+		tempPath = opts.Path + ".tmp"
+	}
+
+	sort.Slice(entries, func(i int, j int) bool {
+		return entries[i].Key < entries[j].Key
+	})
+
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0666)
+	if err != nil {
+		return SnapshotStats{}, err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	header := append([]byte(memorySnapshotMagic), byte(memorySnapshotVersion))
+	if _, err := file.Write(header); err != nil {
+		file.Close()
+		return SnapshotStats{}, err
+	}
+	if err := binary.Write(file, binary.LittleEndian, uint32(len(entries))); err != nil {
+		file.Close()
+		return SnapshotStats{}, err
+	}
+
+	for _, entry := range entries {
+		keyBytes := []byte(entry.Key)
+		if err := binary.Write(file, binary.LittleEndian, uint32(len(keyBytes))); err != nil {
+			file.Close()
+			return SnapshotStats{}, err
+		}
+		if err := binary.Write(file, binary.LittleEndian, uint32(len(entry.Value))); err != nil {
+			file.Close()
+			return SnapshotStats{}, err
+		}
+		if _, err := file.Write(keyBytes); err != nil {
+			file.Close()
+			return SnapshotStats{}, err
+		}
+		if len(entry.Value) > 0 {
+			if _, err := file.Write(entry.Value); err != nil {
+				file.Close()
+				return SnapshotStats{}, err
+			}
+		}
+	}
+
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return SnapshotStats{}, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return SnapshotStats{}, err
+	}
+	if err := file.Close(); err != nil {
+		return SnapshotStats{}, err
+	}
+
+	if err := os.Rename(tempPath, opts.Path); err != nil {
+		return SnapshotStats{}, err
+	}
+	cleanup = false
+
+	return SnapshotStats{
+		Entries: uint32(len(entries)),
+		Bytes:   uint64(info.Size()),
+		Path:    opts.Path,
+	}, nil
 }

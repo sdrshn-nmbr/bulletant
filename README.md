@@ -7,10 +7,14 @@ Bulletant is a compact key-value store with transactions, optional persistence, 
 - Transactions with multi-operation commit/abort semantics
 - Optional write-ahead log (WAL) for recovery
 - Disk storage with on-disk index rebuild and compaction
+- LSM storage with memtables, segments, and bloom filters
 - HTTP server with JSON endpoints
 - Streaming scan API with cursor + prefix
 - Local + HTTP client SDK with retries/backoff
 - Vector store for embeddings + metadata
+- Background compaction scheduler with rate limiting
+- Snapshots + backups
+- CLI with local and HTTP modes
 
 ## Quick start
 Run the HTTP server:
@@ -23,6 +27,20 @@ With disk storage + WAL:
 
 ```
 go run ./cmd/server --listen :8080 --storage disk --data ./bulletant.db --wal ./bulletant.wal
+```
+
+With LSM storage:
+
+```
+go run ./cmd/server --listen :8080 --storage lsm --lsm-dir ./bulletant.lsm
+```
+
+Enable background compaction:
+
+```
+go run ./cmd/server --listen :8080 --storage lsm --lsm-dir ./bulletant.lsm \
+  --compaction-interval 30s --compaction-max-entries 100000 --compaction-max-bytes 104857600 \
+  --compaction-rate-limit-bytes 4194304
 ```
 
 ## HTTP API
@@ -75,6 +93,17 @@ curl -X POST "http://localhost:8080/maintenance/compact" \
   -d '{"max_entries":100000,"max_bytes":10485760}'
 ```
 
+Snapshots + backups:
+```
+curl -X POST "http://localhost:8080/maintenance/snapshot" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"./snapshots/bulletant.snapshot"}'
+
+curl -X POST "http://localhost:8080/maintenance/backup" \
+  -H "Content-Type: application/json" \
+  -d '{"directory":"./backups"}'
+```
+
 Vector store:
 
 ```
@@ -95,6 +124,17 @@ local, err := client.OpenLocal(client.LocalOptions{
 })
 ```
 
+Local client with LSM:
+```
+local, err := client.OpenLocal(client.LocalOptions{
+  StorageType:          client.StorageLSM,
+  LSMDir:               "./bulletant.lsm",
+  LSMMemtableMaxEntries: 50000,
+  LSMMemtableMaxBytes:   8 << 20,
+  LSMSegmentMaxBytes:    16 << 20,
+})
+```
+
 HTTP client:
 ```
 httpClient, err := client.NewHTTPClient(client.HTTPOptions{
@@ -107,12 +147,37 @@ httpClient, err := client.NewHTTPClient(client.HTTPOptions{
 })
 ```
 
+Snapshot + backup via client:
+```
+stats, err := local.Snapshot(context.Background(), client.SnapshotOptions{
+  Path: "./snapshots/bulletant.snapshot",
+})
+
+backup, err := httpClient.Backup(context.Background(), client.BackupOptions{
+  Directory: "./backups",
+})
+```
+
+## CLI
+Local mode:
+```
+go run ./cmd/bulletant --mode=local --storage-type=memory put key value
+go run ./cmd/bulletant --mode=local --storage-type=lsm --lsm-dir ./bulletant.lsm get key
+```
+
+HTTP mode:
+```
+go run ./cmd/bulletant --mode=http --base-url http://localhost:8080 put key value
+go run ./cmd/bulletant --mode=http scan --limit 10 --include-values
+```
+
 ## Packages
 - `internal/storage`: storage backends and vector store
 - `internal/transaction`: transaction model
 - `internal/log`: WAL implementation
 - `internal/db`: DB orchestration + WAL integration
 - `internal/server`: HTTP handlers
+- `internal/maintenance`: compaction scheduler + rate limiter
 - `pkg/client`: local + HTTP SDK
 
 ## Testing
