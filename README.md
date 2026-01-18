@@ -12,6 +12,7 @@ Bulletant is a compact key-value store with transactions, optional persistence, 
 - Streaming scan API with cursor + prefix
 - Local + HTTP client SDK with retries/backoff
 - Vector store for embeddings + metadata
+- Edge AI usage billing ledger with offline sync
 - Background compaction scheduler with rate limiting
 - Snapshots + backups
 - CLI with local and HTTP modes
@@ -114,6 +115,32 @@ curl -X POST "http://localhost:8080/vectors" \
 curl "http://localhost:8080/vectors/<id>"
 ```
 
+## Edge AI usage billing
+Bulletant includes an append-only ledger for local inference metering and offline sync.
+
+Example flow:
+```
+curl -X POST "http://localhost:8080/billing/accounts" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"demo","id":"acct-1"}'
+
+curl -X POST "http://localhost:8080/billing/credits" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"demo","account_id":"acct-1","amount":1000}'
+
+curl -X POST "http://localhost:8080/billing/usage" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"event-1","tenant":"demo","account_id":"acct-1","units":25,"unit_price":10}'
+
+curl "http://localhost:8080/billing/accounts/acct-1/balance?tenant=demo"
+
+curl -X POST "http://localhost:8080/billing/sync/export" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"demo","limit":100}' > billing.ndjson
+```
+
+See `docs/edge-billing.md` and `examples/edge-billing/README.md` for details.
+
 ## Client SDK
 Local client:
 ```
@@ -169,6 +196,18 @@ HTTP mode:
 ```
 go run ./cmd/bulletant --mode=http --base-url http://localhost:8080 put key value
 go run ./cmd/bulletant --mode=http scan --limit 10 --include-values
+```
+
+Edge billing via CLI:
+```
+go run ./cmd/bulletant --mode=http --base-url http://localhost:8080 \
+  billing-account create --tenant demo --id acct-1
+
+go run ./cmd/bulletant --mode=http --base-url http://localhost:8080 \
+  billing-usage record --tenant demo --account-id acct-1 --event-id event-1 --units 25 --unit-price 10
+
+go run ./cmd/bulletant --mode=http --base-url http://localhost:8080 \
+  billing-export --tenant demo --limit 100 > billing.ndjson
 ```
 
 ## Packages

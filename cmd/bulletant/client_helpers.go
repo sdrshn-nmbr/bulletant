@@ -82,3 +82,71 @@ func (c *cliState) backup(ctx context.Context, opts client.BackupOptions) (clien
 	}
 	return c.local.Backup(ctx, opts)
 }
+
+func (c *cliState) createAccount(ctx context.Context, account client.Account) (client.Account, error) {
+	if c.http != nil {
+		return c.http.CreateAccount(ctx, account, c.requestOptions())
+	}
+	return c.local.CreateAccount(ctx, account)
+}
+
+func (c *cliState) getAccount(ctx context.Context, tenant string, accountID string) (client.Account, error) {
+	if c.http != nil {
+		return c.http.GetAccount(ctx, tenant, accountID, c.requestOptions())
+	}
+	return c.local.GetAccount(ctx, tenant, accountID)
+}
+
+func (c *cliState) creditAccount(ctx context.Context, tenant string, accountID string, amount int64) (client.Balance, error) {
+	if c.http != nil {
+		return c.http.CreditAccount(ctx, tenant, accountID, amount, c.requestOptions())
+	}
+	return c.local.CreditAccount(ctx, tenant, accountID, amount)
+}
+
+func (c *cliState) getBalance(ctx context.Context, tenant string, accountID string) (client.Balance, error) {
+	if c.http != nil {
+		return c.http.GetBalance(ctx, tenant, accountID, c.requestOptions())
+	}
+	return c.local.GetBalance(ctx, tenant, accountID)
+}
+
+func (c *cliState) recordUsage(ctx context.Context, event client.UsageEvent) (client.LedgerEntry, error) {
+	if c.http != nil {
+		return c.http.RecordUsage(ctx, event, c.requestOptions())
+	}
+	return c.local.RecordUsage(ctx, event)
+}
+
+func (c *cliState) listUsageEvents(
+	ctx context.Context,
+	tenant string,
+	accountID string,
+	cursor string,
+	limit uint32,
+) ([]client.UsageEvent, string, error) {
+	if c.http != nil {
+		return c.http.ListUsageEvents(ctx, tenant, accountID, cursor, limit, c.requestOptions())
+	}
+	return c.local.ListUsageEvents(ctx, tenant, accountID, cursor, limit)
+}
+
+func (c *cliState) exportEvents(
+	ctx context.Context,
+	tenant string,
+	cursor string,
+	limit uint32,
+	handler func(client.UsageEvent) error,
+) (string, error) {
+	if c.http != nil {
+		return c.http.ExportEvents(ctx, tenant, cursor, limit, c.requestOptions(), handler)
+	}
+	return c.local.ExportEvents(ctx, tenant, cursor, limit, handler)
+}
+
+func (c *cliState) importEvents(ctx context.Context, events []client.UsageEvent) (client.ImportStats, error) {
+	if c.http != nil {
+		return c.http.ImportEvents(ctx, events, c.requestOptions())
+	}
+	return c.local.ImportEvents(ctx, events)
+}
